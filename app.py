@@ -6,6 +6,8 @@ import json
 import time
 import base64
 import tempfile
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 import streamlit.components.v1 as components
 from reportlab.lib.pagesizes import A4, mm
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
@@ -14,29 +16,43 @@ from reportlab.lib import colors
 from reportlab.pdfgen import canvas
 from pypdf import PdfReader, PdfWriter, Transformation, PageObject
 
-# --- WINDOWS PRINTING DETECTION ---
-try:
-    import win32print
-    import win32api
-    HAS_WIN32 = True
-except ImportError:
-    HAS_WIN32 = False
-
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Hike Warehouse Manager", layout="wide")
 
-# --- AUTHENTICATION ---
-USERS_FILE = "users.json"
+# --- DATABASE CONNECTION (GOOGLE SHEETS) ---
+def get_db_connection():
+    # Requires st.secrets to be set up on Streamlit Cloud
+    # If running locally without secrets, this will fail gracefully or need a local json file
+    try:
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        client = gspread.authorize(creds)
+        sheet_url = st.secrets["database"]["sheet_url"]
+        return client.open_by_url(sheet_url)
+    except Exception as e:
+        st.error(f"Database Connection Error: {e}. Check your Secrets.")
+        st.stop()
 
+# --- AUTHENTICATION (PERSISTENT) ---
 def load_users():
-    if not os.path.exists(USERS_FILE):
-        default_users = {"admin": "admin123"}
-        with open(USERS_FILE, "w") as f: json.dump(default_users, f)
-        return default_users
-    with open(USERS_FILE, "r") as f: return json.load(f)
+    try:
+        sh = get_db_connection()
+        ws = sh.worksheet("Users")
+        data = ws.get_all_records()
+        if not data: return {"admin": "admin123"} 
+        # Convert all to strings to avoid type issues
+        return {str(row['username']): str(row['password']) for row in data}
+    except: return {"admin": "admin123"}
 
 def save_users(users_dict):
-    with open(USERS_FILE, "w") as f: json.dump(users_dict, f)
+    try:
+        sh = get_db_connection()
+        ws = sh.worksheet("Users")
+        ws.clear()
+        rows = [["username", "password"]] + [[u, p] for u, p in users_dict.items()]
+        ws.update(rows)
+    except Exception as e: st.error(f"DB Error: {e}")
 
 if 'logged_in' not in st.session_state: st.session_state['logged_in'] = False
 
@@ -48,7 +64,7 @@ if not st.session_state['logged_in']:
         users = load_users()
         if u in users and users[u] == p:
             st.session_state['logged_in'] = True; st.session_state['username'] = u; st.rerun()
-        else: st.error("Invalid")
+        else: st.error("Invalid Username or Password")
     st.stop()
 
 # --- SIDEBAR & SETTINGS ---
@@ -56,148 +72,75 @@ with st.sidebar:
     st.write(f"👤 **{st.session_state['username']}**")
     if st.button("Logout"): st.session_state['logged_in'] = False; st.rerun()
     
+    if st.session_state['username'] == 'admin':
+        with st.expander("Admin: Add User"):
+            new_u = st.text_input("New User"); new_p = st.text_input("New Pass")
+            if st.button("Save User"): 
+                users = load_users(); users[new_u] = new_p; save_users(users)
+                st.success("Saved!"); time.sleep(1); st.rerun()
+
     st.divider()
     st.header("🖨️ Printing Mode")
     
-    # 3 Options now
-    options = ["Local (Direct USB)", "Web (QZ Tray / Kiosk)", "Normal Print (Browser Popup)"]
-    # Default index depends on environment
-    idx = 0 if HAS_WIN32 else 2 
+    # Updated 3 Options
+    print_mode = st.radio("Select Method:", 
+                          ["Web (QZ Tray / Kiosk)", "Normal Print (Browser Popup)", "Local (Direct USB)"], 
+                          index=1)
     
-    print_mode = st.radio("Select Method:", options, index=idx)
-    
-    if print_mode == "Local (Direct USB)":
-        if not HAS_WIN32: st.error("❌ 'pywin32' missing. Cannot use Local mode.")
-        else: st.success("✅ Connected to Windows Spooler")
-    elif print_mode == "Web (QZ Tray / Kiosk)":
-        st.info("ℹ️ Best for fast, silent printing (Requires QZ Tray).")
+    if print_mode == "Web (QZ Tray / Kiosk)":
+        st.info("Silent printing via QZ Tray.")
+    elif print_mode == "Normal Print (Browser Popup)":
+        st.info("Opens standard print dialog (PDF).")
     else:
-        st.info("ℹ️ Opens standard print dialog. No setup required.")
+        st.info("Requires Windows Server + USB connection.")
 
-# --- FILE PATHS ---
-CACHE_FILE = "master_data.csv"
-HISTORY_FILE = "consignment_history.json"
-SENDERS_FILE = "senders.xlsx"
-RECEIVERS_FILE = "receivers.xlsx"
+# --- FILE PATHS (Local Temp Storage) ---
 FILES_DIR = "consignment_files"
+CACHE_FILE = "master_data.csv" 
 SHEET_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRdLEddTZgmuUSswPp3A_HM7DGH8UCUWEmqd-cIbbJ7nb_Eq4YvZxO0vjWESlxX-9Y6VWRcVLPFlIVp/pub?gid=0&single=true&output=csv"
 
 if not os.path.exists(FILES_DIR): os.makedirs(FILES_DIR)
 
-# --- PRINTING FUNCTIONS ---
-
-# 1. LOCAL WINDOWS PRINTING
-def get_windows_printers():
-    if not HAS_WIN32: return []
-    try:
-        printers = win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS)
-        return [p[2] for p in printers]
-    except: return ["Default"]
-
-def print_local_windows(pdf_path, printer_name):
-    try:
-        win32api.ShellExecute(0, "printto", pdf_path, f'"{printer_name}"', ".", 0)
-        return True, "Sent to Local Printer"
-    except Exception as e:
-        return False, str(e)
-
-# 2. QZ TRAY PRINTING (Silent JS Injection)
-def trigger_qz_print(pdf_bytes, printer_name):
-    base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
-    qz_script = f"""
-    <html>
-    <head><script src="https://cdn.jsdelivr.net/npm/qz-tray@2.2.4/qz-tray.min.js"></script></head>
-    <body>
-        <script>
-            var printerName = "{printer_name}";
-            var pdfData = "{base64_pdf}";
-            qz.websocket.connect().then(function() {{
-                return qz.printers.find(printerName ? printerName : undefined);
-            }}).then(function(printer) {{
-                var config = qz.configs.create(printer);
-                var data = [{{ type: 'pixel', format: 'pdf', flavor: 'base64', data: pdfData }}];
-                return qz.print(config, data);
-            }}).then(function() {{
-                return qz.websocket.disconnect();
-            }}).catch(function(e) {{
-                console.error(e);
-                alert("QZ Tray Error: " + e);
-            }});
-        </script>
-    </body>
-    </html>
-    """
-    components.html(qz_script, height=0, width=0)
-
-def list_printers_js():
-    js = """
-    <html>
-    <head><script src="https://cdn.jsdelivr.net/npm/qz-tray@2.2.4/qz-tray.min.js"></script></head>
-    <body>
-        <script>
-            qz.websocket.connect().then(function() {
-                return qz.printers.find();
-            }).then(function(printers) {
-                alert("Available Printers:\\n" + printers.join("\\n"));
-                return qz.websocket.disconnect();
-            }).catch(function(e) {
-                alert("Error: " + e);
-            });
-        </script>
-    </body>
-    </html>
-    """
-    components.html(js, height=0, width=0)
-
-# 3. NORMAL BROWSER POPUP PRINTING
-def trigger_normal_popup_print(pdf_bytes):
-    base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
-    # Simple iframe, standard window.print()
-    pdf_display = f"""
-        <iframe src="data:application/pdf;base64,{base64_pdf}" 
-                id="pdf_frame" 
-                style="position:absolute; top:-10000px; left:-10000px; width:1px; height:1px;">
-        </iframe>
-        <script>
-            setTimeout(function() {{
-                var frame = document.getElementById('pdf_frame');
-                frame.contentWindow.focus();
-                frame.contentWindow.print();
-            }}, 500); 
-        </script>
-    """
-    components.html(pdf_display, height=0, width=0)
-
-# --- DATA MANAGERS ---
+# --- PERMANENT DATA MANAGERS (GOOGLE SHEETS) ---
 def load_history():
-    if os.path.exists(HISTORY_FILE):
-        with open(HISTORY_FILE, 'r') as f:
-            try:
-                history = json.load(f)
-                for h in history:
-                    if 'data' in h: h['data'] = pd.DataFrame(h['data'])
-                    if 'original_data' in h: h['original_data'] = pd.DataFrame(h['original_data'])
-                    if 'printed_boxes' not in h: h['printed_boxes'] = [] 
-                return history
-            except: return []
-    return []
+    try:
+        sh = get_db_connection(); ws = sh.worksheet("History")
+        records = ws.get_all_records()
+        history = []
+        for r in records:
+            if not r['data_json']: continue
+            con_obj = json.loads(r['data_json'])
+            if 'data' in con_obj: con_obj['data'] = pd.DataFrame(con_obj['data'])
+            if 'original_data' in con_obj: con_obj['original_data'] = pd.DataFrame(con_obj['original_data'])
+            history.append(con_obj)
+        return history
+    except: return []
 
 def save_history(history_list):
-    serializable_list = []
-    for h in history_list:
-        h_copy = h.copy()
-        if 'data' in h_copy and isinstance(h_copy['data'], pd.DataFrame):
-            h_copy['data'] = h_copy['data'].to_dict('records')
-        if 'original_data' in h_copy and isinstance(h_copy['original_data'], pd.DataFrame):
-            h_copy['original_data'] = h_copy['original_data'].to_dict('records')
-        serializable_list.append(h_copy)
-    with open(HISTORY_FILE, 'w') as f: json.dump(serializable_list, f)
+    try:
+        sh = get_db_connection(); ws = sh.worksheet("History"); ws.clear()
+        rows = [["id", "date", "channel", "data_json"]]
+        for h in history_list:
+            h_copy = h.copy()
+            if 'data' in h_copy and isinstance(h_copy['data'], pd.DataFrame): h_copy['data'] = h_copy['data'].to_dict('records')
+            if 'original_data' in h_copy and isinstance(h_copy['original_data'], pd.DataFrame): h_copy['original_data'] = h_copy['original_data'].to_dict('records')
+            rows.append([h['id'], h['date'], h['channel'], json.dumps(h_copy)])
+        ws.update(rows)
+    except Exception as e: st.error(f"Save Error: {e}")
 
-def load_address_data(file_path, default_cols):
-    if os.path.exists(file_path): return pd.read_excel(file_path, dtype=str)
-    return pd.DataFrame(columns=default_cols)
+def load_address_data(sheet_name, default_cols):
+    try:
+        sh = get_db_connection(); ws = sh.worksheet(sheet_name)
+        data = ws.get_all_records()
+        if not data: return pd.DataFrame(columns=default_cols)
+        return pd.DataFrame(data).astype(str)
+    except: return pd.DataFrame(columns=default_cols)
 
-def save_address_data(file_path, df): df.to_excel(file_path, index=False)
+def save_address_data(sheet_name, df):
+    try:
+        sh = get_db_connection(); ws = sh.worksheet(sheet_name); ws.clear()
+        ws.update([df.columns.values.tolist()] + df.values.tolist())
+    except Exception as e: st.error(f"Save Error: {e}")
 
 def sync_data():
     try:
@@ -210,63 +153,70 @@ def sync_data():
 def load_master_data():
     return pd.read_csv(CACHE_FILE, dtype={'EAN': str}) if os.path.exists(CACHE_FILE) else pd.DataFrame()
 
-# --- FILE HELPERS ---
+# --- PRINTING HELPERS ---
+def get_merged_labels_path(c_id): return os.path.join(FILES_DIR, c_id, "merged_labels.pdf")
 def save_uploaded_file(uploaded_file, c_id, file_type):
-    c_dir = os.path.join(FILES_DIR, c_id)
+    c_dir = os.path.join(FILES_DIR, c_id); 
     if not os.path.exists(c_dir): os.makedirs(c_dir)
     file_path = os.path.join(c_dir, f"{file_type}.pdf")
     with open(file_path, "wb") as f: f.write(uploaded_file.getbuffer())
     return file_path
-
 def get_stored_file(c_id, file_type):
     file_path = os.path.join(FILES_DIR, c_id, f"{file_type}.pdf")
     return file_path if os.path.exists(file_path) else None
-
-def get_merged_labels_path(c_id):
-    return os.path.join(FILES_DIR, c_id, "merged_labels.pdf")
-
 def extract_box_pdf_page(merged_pdf_path, box_index):
     try:
-        reader = PdfReader(merged_pdf_path)
-        writer = PdfWriter()
+        reader = PdfReader(merged_pdf_path); writer = PdfWriter()
         if box_index >= len(reader.pages): return None, None
         writer.add_page(reader.pages[box_index])
-        
-        # Return Bytes (for Web) AND Temp Path (for Local)
-        output_bytes = io.BytesIO()
-        writer.write(output_bytes)
-        
+        output_bytes = io.BytesIO(); writer.write(output_bytes)
         return output_bytes.getvalue(), writer
     except: return None, None
 
-# --- GENERATORS ---
+# 1. QZ Tray Logic
+def trigger_qz_print(pdf_bytes, printer_name):
+    base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
+    qz_script = f"""<html><head><script src="https://cdn.jsdelivr.net/npm/qz-tray@2.2.4/qz-tray.min.js"></script></head><body><script>
+        var printerName = "{printer_name}"; var pdfData = "{base64_pdf}";
+        qz.websocket.connect().then(function() {{ return qz.printers.find(printerName ? printerName : undefined); }})
+        .then(function(printer) {{ var config = qz.configs.create(printer); var data = [{{ type: 'pixel', format: 'pdf', flavor: 'base64', data: pdfData }}]; return qz.print(config, data); }})
+        .then(function() {{ return qz.websocket.disconnect(); }}).catch(function(e) {{ alert("QZ Error: " + e); }});
+    </script></body></html>"""
+    components.html(qz_script, height=0, width=0)
+
+# 2. Normal Browser Popup Logic
+def trigger_normal_popup_print(pdf_bytes):
+    base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
+    # Embeds PDF and calls window.print()
+    pdf_display = f"""<iframe src="data:application/pdf;base64,{base64_pdf}" id="pdf_frame" style="position:absolute; top:-10000px; left:-10000px; width:1px; height:1px;"></iframe>
+    <script>setTimeout(function() {{ var frame = document.getElementById('pdf_frame'); frame.contentWindow.focus(); frame.contentWindow.print(); }}, 1000);</script>"""
+    components.html(pdf_display, height=0, width=0)
+
+def list_printers_js():
+    js = """<html><head><script src="https://cdn.jsdelivr.net/npm/qz-tray@2.2.4/qz-tray.min.js"></script></head><body><script>
+    qz.websocket.connect().then(function() {{ return qz.printers.find(); }}).then(function(printers) {{ alert("Printers:\\n" + printers.join("\\n")); return qz.websocket.disconnect(); }});</script></body></html>"""
+    components.html(js, height=0, width=0)
+
+# --- GENERATORS (PDFs) ---
 def generate_confirm_consignment_csv(df):
-    output = io.BytesIO()
-    sorted_df = df.sort_values(by='SKU Id')
-    rows = []
-    box_counter = 1
+    output = io.BytesIO(); sorted_df = df.sort_values(by='SKU Id'); rows = []; box_counter = 1
     for _, row in sorted_df.iterrows():
         try: num_boxes = int(row['Editable Boxes']); ppcn = int(float(row['PPCN'])) if float(row['PPCN']) > 0 else 1; fsn = row.get('FSN', '')
         except: num_boxes=0; ppcn=1; fsn=''
         nominal_val = 350 * ppcn
         for _ in range(num_boxes):
-            rows.append({'BOX NUMBER': box_counter, 'BOX NAME': box_counter, 'LENGTH (cm)': 75, 'BREADTH (cm)': 55, 'HEIGHT (cm)': 40, 'WEIGHT (kg)': 10, 'NOMINAL VALUE (INR)': nominal_val, 'FSN': fsn, 'QUANTITY': ppcn})
-            box_counter += 1
+            rows.append({'BOX NUMBER': box_counter, 'BOX NAME': box_counter, 'LENGTH (cm)': 75, 'BREADTH (cm)': 55, 'HEIGHT (cm)': 40, 'WEIGHT (kg)': 10, 'NOMINAL VALUE (INR)': nominal_val, 'FSN': fsn, 'QUANTITY': ppcn}); box_counter += 1
     export_df = pd.DataFrame(rows); export_df.to_csv(output, index=False); return output.getvalue()
 
 def generate_merged_box_labels(df, c_details, sender, receiver, flipkart_pdf_path, progress_bar=None, save_path=None):
     if not flipkart_pdf_path: return None
     with open(flipkart_pdf_path, "rb") as f: pdf_bytes = f.read()
-    box_data = []
-    total_boxes = int(df['Editable Boxes'].sum())
-    current_box = 1
-    sorted_df = df.sort_values(by='SKU Id')
+    box_data = []; total_boxes = int(df['Editable Boxes'].sum()); current_box = 1; sorted_df = df.sort_values(by='SKU Id')
     for _, row in sorted_df.iterrows():
         try: boxes = int(row['Editable Boxes'])
         except: boxes = 0
         for _ in range(boxes):
-            box_data.append({'num': current_box, 'total': total_boxes, 'sku': str(row['SKU Id']), 'qty': row['PPCN'], 'fsn': str(row.get('FSN', '')), 'id': c_details['id'], 'ch': c_details['channel']})
-            current_box += 1
+            box_data.append({'num': current_box, 'total': total_boxes, 'sku': str(row['SKU Id']), 'qty': row['PPCN'], 'fsn': str(row.get('FSN', '')), 'id': c_details['id'], 'ch': c_details['channel']}); current_box += 1
     writer = PdfWriter(); w_a4, h_a4 = A4; half_h = h_a4/2; SHIFT_UP = 25*mm
     for i, box in enumerate(box_data):
         if progress_bar: progress_bar.progress(int((i+1)/len(box_data)*100))
@@ -277,17 +227,13 @@ def generate_merged_box_labels(df, c_details, sender, receiver, flipkart_pdf_pat
             c.line(x,y_d,x,y_h+row_h); c.line(x1,y_d,x1,y_h+row_h); c.line(x2,y_d,x2,y_h+row_h); c.line(x3,y_d,x3,y_h+row_h); c.line(xe,y_d,xe,y_h+row_h)
             c.setFont("Helvetica-Bold", 12); c.drawString(x+2*mm,y_h+3*mm,"SR NO."); c.drawString(x1+2*mm,y_h+3*mm,"FSN"); c.drawString(x2+2*mm,y_h+3*mm,"SKU ID"); c.drawString(x3+2*mm,y_h+3*mm,"QTY")
             c.setFont("Helvetica", 12); c.drawString(x+2*mm,y_d+3*mm,"1."); c.drawString(x1+2*mm,y_d+3*mm,box['fsn']); c.drawString(x2+2*mm,y_d+3*mm,box['sku'][:35])
-            c.setFont("Helvetica-Bold", 14); c.drawString(x3+2*mm,y_d+3*mm,str(int(float(box['qty']))) )
-            return y_d
+            c.setFont("Helvetica-Bold", 14); c.drawString(x3+2*mm,y_d+3*mm,str(int(float(box['qty']))) ); return y_d
         def draw_slip(y_base):
-            c.setFont("Helvetica-Bold", 30); c.drawCentredString(w_a4/2, y_base+45*mm, "PACKING SLIP")
-            db_y = draw_grid_table(y_base+32*mm)
+            c.setFont("Helvetica-Bold", 30); c.drawCentredString(w_a4/2, y_base+45*mm, "PACKING SLIP"); db_y = draw_grid_table(y_base+32*mm)
             c.setFont("Helvetica-Bold", 30); c.drawCentredString(w_a4/2, db_y-5*mm, f"BOX NO.- {box['num']}         BOX NAME- {box['num']}")
-        draw_slip(240*mm); c.setLineWidth(2); c.line(0, 210*mm, w_a4, 210*mm)
-        draw_slip(155*mm); c.setLineWidth(1); c.line(0, half_h, w_a4, half_h)
+        draw_slip(240*mm); c.setLineWidth(2); c.line(0, 210*mm, w_a4, 210*mm); draw_slip(155*mm); c.setLineWidth(1); c.line(0, half_h, w_a4, half_h)
         c.save(); packet.seek(0); custom_page = PdfReader(packet).pages[0]
-        fk_idx = i // 2; is_top = (i%2==0)
-        temp_reader = PdfReader(io.BytesIO(pdf_bytes))
+        fk_idx = i // 2; is_top = (i%2==0); temp_reader = PdfReader(io.BytesIO(pdf_bytes))
         result_page = PageObject.create_blank_page(width=w_a4, height=h_a4); result_page.merge_page(custom_page)
         if fk_idx < len(temp_reader.pages):
             fk_page = temp_reader.pages[fk_idx]; fk_h = fk_page.mediabox.height; fk_w = fk_page.mediabox.width
@@ -301,20 +247,16 @@ def generate_merged_box_labels(df, c_details, sender, receiver, flipkart_pdf_pat
     out=io.BytesIO(); writer.write(out); return out.getvalue()
 
 def generate_consignment_data_pdf(df, c_details):
-    buffer = io.BytesIO(); doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=10*mm, leftMargin=10*mm, topMargin=10*mm, bottomMargin=10*mm); elements = []; styles = getSampleStyleSheet()
-    elements.append(Paragraph(f"<b>Consignment ID:</b> {c_details['id']}", styles['Heading2']))
-    elements.append(Paragraph(f"<b>Pickup Date:</b> {c_details['date']}", styles['Normal']))
-    elements.append(Spacer(1, 10))
-    sorted_df = df.sort_values(by='SKU Id')
-    data = [['SKU', 'QTY', 'No. of Box']]; t_qty, t_box = 0, 0
+    buffer = io.BytesIO(); doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=10*mm, leftMargin=10*mm, topMargin=10*mm, bottomMargin=10*mm); elements = []
+    elements.append(Paragraph(f"<b>Consignment ID:</b> {c_details['id']}", getSampleStyleSheet()['Heading2']))
+    elements.append(Paragraph(f"<b>Pickup Date:</b> {c_details['date']}", getSampleStyleSheet()['Normal'])); elements.append(Spacer(1, 10))
+    sorted_df = df.sort_values(by='SKU Id'); data = [['SKU', 'QTY', 'No. of Box']]; t_qty, t_box = 0, 0
     for _, row in sorted_df.iterrows():
         qty = int(row['Editable Qty']); box = int(row['Editable Boxes']); t_qty += qty; t_box += box
         data.append([str(row['SKU Id']), str(qty), str(box)])
     data.append(['TOTAL', str(t_qty), str(t_box)])
-    table = Table(data, colWidths=[110*mm, 30*mm, 30*mm])
-    table.setStyle(TableStyle([('GRID', (0,0), (-1,-1), 1, colors.black), ('BACKGROUND', (0,0), (-1,0), colors.lightgrey), ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'), ('ALIGN', (1,0), (-1,-1), 'CENTER'), ('ALIGN', (0,0), (0,-1), 'LEFT'), ('FONTNAME', (0,-1), (-1,-1), 'Helvetica-Bold'), ('BACKGROUND', (0,-1), (-1,-1), colors.whitesmoke)]))
-    elements.append(table)
-    doc.build(elements); return buffer.getvalue()
+    table = Table(data, colWidths=[110*mm, 30*mm, 30*mm]); table.setStyle(TableStyle([('GRID', (0,0), (-1,-1), 1, colors.black), ('BACKGROUND', (0,0), (-1,0), colors.lightgrey), ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'), ('ALIGN', (1,0), (-1,-1), 'CENTER')]))
+    elements.append(table); doc.build(elements); return buffer.getvalue()
 
 def generate_bartender_full(df):
     output = io.BytesIO(); master_df = load_master_data()
@@ -323,8 +265,7 @@ def generate_bartender_full(df):
     if 'EAN' in export_df.columns: export_df['EAN'] = export_df['EAN'].astype(str).str.replace(r'\.0$', '', regex=True)
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         export_df.to_excel(writer, index=False); workbook = writer.book; worksheet = writer.sheets['Sheet1']
-        fmt = workbook.add_format({'num_format': '@'})
-        if 'EAN' in export_df.columns: worksheet.set_column(export_df.columns.get_loc('EAN'), export_df.columns.get_loc('EAN'), 20, fmt)
+        if 'EAN' in export_df.columns: worksheet.set_column(export_df.columns.get_loc('EAN'), export_df.columns.get_loc('EAN'), 20, workbook.add_format({'num_format': '@'}))
     return output.getvalue()
 
 def generate_excel_simple(df, cols, filename):
@@ -341,8 +282,6 @@ def home_button():
 if 'page' not in st.session_state: st.session_state['page'] = 'home'
 if 'consignments' not in st.session_state: st.session_state['consignments'] = load_history()
 addr_cols = ['Code', 'Address1', 'Address2', 'City', 'State', 'Pincode', 'GST', 'Channel']
-if not os.path.exists(SENDERS_FILE): save_address_data(SENDERS_FILE, pd.DataFrame([{'Code': 'MAIN', 'Address1': 'Addr', 'City': 'City', 'Channel': 'All'}]))
-if not os.path.exists(RECEIVERS_FILE): save_address_data(RECEIVERS_FILE, pd.DataFrame(columns=addr_cols))
 
 # 1. HOME
 if st.session_state['page'] == 'home':
@@ -359,15 +298,12 @@ if st.session_state['page'] == 'home':
     if c1.button("🛒 Flipkart", use_container_width=True): st.session_state['current_channel']='Flipkart'; nav('channel')
     if c2.button("📦 Amazon", use_container_width=True): st.session_state['current_channel']='Amazon'; nav('channel')
     if c3.button("🛍️ Myntra", use_container_width=True): st.session_state['current_channel']='Myntra'; nav('channel')
-    
     with st.sidebar:
         st.header("Settings")
-        # FIX: Unwrap logic error
         if st.button("🔄 Sync Data"):
             s, m = sync_data()
             if s: st.success(m)
             else: st.error(m)
-    
     st.divider()
     with st.expander("📂 View History"):
         if st.session_state['consignments']:
@@ -389,44 +325,40 @@ elif st.session_state['page'] == 'channel':
 # 3. ADD
 elif st.session_state['page'] == 'add':
     home_button(); st.title("New Consignment"); c_id = st.text_input("Consignment ID"); p_date = st.date_input("Pickup Date")
-    df_s = load_address_data(SENDERS_FILE, addr_cols); df_r = load_address_data(RECEIVERS_FILE, addr_cols)
+    df_s = load_address_data("Senders", addr_cols); df_r = load_address_data("Receivers", addr_cols)
     c1, c2 = st.columns(2)
     with c1:
         s_sel = st.selectbox("Sender", df_s['Code'].tolist() + ["+ Add New"])
         if s_sel == "+ Add New":
             with st.form("ns"):
                 ns = {k: st.text_input(k) for k in addr_cols if k!='Channel'}; ns['Channel']='All'
-                if st.form_submit_button("Save"): save_address_data(SENDERS_FILE, pd.concat([df_s, pd.DataFrame([ns])], ignore_index=True)); st.rerun()
+                if st.form_submit_button("Save"): save_address_data("Senders", pd.concat([df_s, pd.DataFrame([ns])], ignore_index=True)); st.rerun()
     with c2:
-        r_list = df_r[df_r['Channel']==st.session_state['current_channel']]['Code'].tolist()
+        r_list = df_r[df_r['Channel']==st.session_state['current_channel']]['Code'].tolist() if not df_r.empty else []
         r_sel = st.selectbox("Receiver", r_list + ["+ Add New"])
         if r_sel == "+ Add New":
             with st.form("nr"):
                 nr = {k: st.text_input(k) for k in addr_cols if k!='Channel'}; nr['Channel']=st.session_state['current_channel']
-                if st.form_submit_button("Save"): save_address_data(RECEIVERS_FILE, pd.concat([df_r, pd.DataFrame([nr])], ignore_index=True)); st.rerun()
+                if st.form_submit_button("Save"): save_address_data("Receivers", pd.concat([df_r, pd.DataFrame([nr])], ignore_index=True)); st.rerun()
     uploaded = st.file_uploader("Upload CSV", type='csv')
     if uploaded and c_id and s_sel != "+ Add New":
         if st.button("Process"):
             if c_id in [c['id'] for c in st.session_state['consignments']]: st.error("ID exists!"); st.stop()
-            
-            df_m = load_master_data()
+            df_m = load_master_data(); 
             if df_m.empty: st.error("Sync Data!"); st.stop()
-            
             df_raw = pd.read_csv(uploaded); uploaded.seek(0); df_c = pd.read_csv(uploaded)
             
-            # --- VALIDATION STEP ---
-            # Check if all SKU Ids in CSV exist in Master Data
+            # --- CRITICAL SKU VALIDATION ---
             csv_skus = set(df_c['SKU Id'].astype(str))
             master_skus = set(df_m['SKU'].astype(str))
+            missing = [s for s in csv_skus if s not in master_skus]
             
-            missing_skus = [sku for sku in csv_skus if sku not in master_skus]
-            
-            if missing_skus:
-                st.error("❌ CRITICAL ERROR: The following SKUs are missing from Master Data:")
-                st.dataframe(pd.DataFrame(missing_skus, columns=["Missing SKUs"]), use_container_width=True)
-                st.error("Please add these SKUs to Master Data (Sync) before processing. Processing Stopped.")
+            if missing:
+                st.error("🚨 STOP! Found SKUs in file that are NOT in Master Data:")
+                st.dataframe(pd.DataFrame(missing, columns=["Missing SKU IDs"]), use_container_width=True)
+                st.error("Please add these to Master Data and Sync before proceeding.")
                 st.stop()
-            # -----------------------
+            # -------------------------------
 
             merged = pd.merge(df_c, df_m, left_on='SKU Id', right_on='SKU', how='left')
             merged['Editable Qty'] = merged['Quantity Sent'].fillna(0); merged['PPCN'] = pd.to_numeric(merged['PPCN'], errors='coerce').fillna(1)
@@ -441,11 +373,9 @@ elif st.session_state['page'] == 'preview':
     st.dataframe(disp, hide_index=True, use_container_width=True)
     if st.button("💾 SAVE", type="primary"): pkg['saved'] = True; st.session_state['consignments'].append(pkg); save_history(st.session_state['consignments']); nav('view_saved')
 
-# 5. SCAN & PRINT PAGE (HYBRID)
+# 5. SCAN & PRINT PAGE
 elif st.session_state['page'] == 'scan_print':
     pkg = st.session_state['curr_con']; c_id = pkg['id']; merged_pdf_path = get_merged_labels_path(c_id)
-
-    # 1. Expand Box Data
     if 'scan_box_data' not in st.session_state or st.session_state.get('scan_c_id') != c_id:
         box_data = []; current_box = 1; sorted_df = pkg['data'].sort_values(by='SKU Id')
         for _, row in sorted_df.iterrows():
@@ -458,39 +388,25 @@ elif st.session_state['page'] == 'scan_print':
 
     df_boxes = st.session_state['scan_box_data']
 
-    # 2. Hybrid Logic
     def handle_print_action(box_num):
         bytes_data, writer = extract_box_pdf_page(merged_pdf_path, int(box_num)-1)
         if not bytes_data: st.error("PDF Error"); return False
-
-        if print_mode == "Local (Direct USB)":
-            if not HAS_WIN32: st.error("Win32 API missing"); return False
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                writer.write(tmp); tmp_path = tmp.name
-            printer = st.session_state.get('selected_printer_local')
-            if printer:
-                success, msg = print_local_windows(tmp_path, printer)
-                time.sleep(1) # Wait for spool
-                try: os.remove(tmp_path) 
-                except: pass
-                if success: return True
-                else: st.error(msg); return False
-            else: st.warning("Select printer!"); return False
-
-        elif print_mode == "Web (QZ Tray / Kiosk)":
-            st.session_state['web_print_trigger'] = bytes_data # Trigger QZ JS
+        
+        if print_mode == "Web (QZ Tray / Kiosk)":
+            st.session_state['web_print_trigger'] = bytes_data
             return True
-            
-        else: # Normal Print (Browser Popup)
-            st.session_state['normal_print_trigger'] = bytes_data # Trigger Normal JS
+        elif print_mode == "Normal Print (Browser Popup)":
+            st.session_state['normal_print_trigger'] = bytes_data
             return True
+        else:
+            st.error("Local printing not supported in Cloud Mode.")
+            return False
 
     def process_scan():
-        scan_val = st.session_state.scan_input.strip()
+        scan_val = st.session_state.scan_input.strip(); 
         if not scan_val: return
         matches = df_boxes[(df_boxes['SKU'] == scan_val) | (df_boxes['FSN'] == scan_val) | (df_boxes['EAN'] == scan_val)]
-        if matches.empty:
-            st.toast(f"❌ Not found: {scan_val}", icon="⚠️")
+        if matches.empty: st.toast(f"❌ Not found: {scan_val}", icon="⚠️")
         else:
             printed_set = set(pkg.get('printed_boxes', []))
             valid_boxes = matches[~matches['Box No'].isin(printed_set)]
@@ -506,43 +422,30 @@ elif st.session_state['page'] == 'scan_print':
         st.session_state.scan_input = ""
 
     def trigger_reprint_manual(box_num):
-        if handle_print_action(box_num):
-            st.session_state['last_printed_box'] = int(box_num)
-            st.toast(f"🖨️ Re-printing Box {box_num}...", icon="✅")
+        if handle_print_action(box_num): st.session_state['last_printed_box'] = int(box_num); st.toast(f"🖨️ Re-printing Box {box_num}...", icon="✅")
 
-    # --- UI ---
     c_back, c_spacer, c_pr = st.columns([1, 4, 2])
     with c_back: 
         if st.button("🔙 Back", use_container_width=True): nav('view_saved')
     
     with c_pr:
-        if print_mode == "Local (Direct USB)":
-            printers = get_windows_printers()
-            if 'selected_printer_local' not in st.session_state: st.session_state['selected_printer_local'] = printers[0] if printers else None
-            st.selectbox("Select Printer", printers, key='selected_printer_local', label_visibility="collapsed")
-        elif print_mode == "Web (QZ Tray / Kiosk)":
+        if print_mode == "Web (QZ Tray / Kiosk)":
             if 'qz_printer_name' not in st.session_state: st.session_state['qz_printer_name'] = ""
             st.text_input("Exact Printer Name", key='qz_printer_name', placeholder="Printer Name for QZ Tray")
             if st.button("Show My Printers"): list_printers_js()
-        else:
-            st.caption("ℹ️ Standard Browser Popup Mode")
+        elif print_mode == "Normal Print (Browser Popup)":
+            st.caption("🌐 Using Browser Popup (Ctrl+P behavior)")
 
-    st.divider()
-    st.text_input("SCAN BARCODE", key='scan_input', on_change=process_scan)
+    st.divider(); st.text_input("SCAN BARCODE", key='scan_input', on_change=process_scan)
 
-    # --- PRINT TRIGGERS ---
     if 'web_print_trigger' in st.session_state:
-        trigger_qz_print(st.session_state['web_print_trigger'], st.session_state.get('qz_printer_name', ""))
-        del st.session_state['web_print_trigger']
-    
+        trigger_qz_print(st.session_state['web_print_trigger'], st.session_state.get('qz_printer_name', "")); del st.session_state['web_print_trigger']
     if 'normal_print_trigger' in st.session_state:
-        trigger_normal_popup_print(st.session_state['normal_print_trigger'])
-        del st.session_state['normal_print_trigger']
+        trigger_normal_popup_print(st.session_state['normal_print_trigger']); del st.session_state['normal_print_trigger']
 
     last_p = st.session_state.get('last_printed_box')
     if last_p: st.info(f"🖨️ Sent to Printer: **BOX {last_p}**", icon="✨")
 
-    # Table
     printed_set = set(pkg.get('printed_boxes', [])); display_df = df_boxes.copy()
     display_df['Status'] = display_df['Box No'].apply(lambda x: '✅ PRINTED' if x in printed_set else 'WAITING')
     def highlight_rows(row):
@@ -550,26 +453,21 @@ elif st.session_state['page'] == 'scan_print':
         elif row['Status'] == '✅ PRINTED': return ['background-color: #d4edda'] * len(row)
         return [''] * len(row)
     
-    st.subheader("Box List")
-    event = st.dataframe(display_df.style.apply(highlight_rows, axis=1), use_container_width=True, hide_index=True, height=500, on_select="rerun", selection_mode="single-row")
+    st.subheader("Box List"); event = st.dataframe(display_df.style.apply(highlight_rows, axis=1), use_container_width=True, hide_index=True, height=500, on_select="rerun", selection_mode="single-row")
     if event.selection.rows:
         sel_box = display_df.iloc[event.selection.rows[0]]['Box No']
         if st.button(f"🖨️ Reprint Box {sel_box}", type="primary", use_container_width=True): trigger_reprint_manual(sel_box)
 
 # 6. VIEW SAVED
 elif st.session_state['page'] == 'view_saved':
-    home_button(); pkg = st.session_state['curr_con']; c_id = pkg['id']
-    st.title(f"Consignment: {c_id}")
-    
+    home_button(); pkg = st.session_state['curr_con']; c_id = pkg['id']; st.title(f"Consignment: {c_id}")
     r1, r2, r3 = st.columns(3)
     with r1: csv_b=io.BytesIO(); pkg['original_data'].to_csv(csv_b, index=False); st.download_button("⬇ CSV", csv_b.getvalue(), f"{c_id}.csv")
     with r2: st.download_button("⬇ Data PDF", generate_consignment_data_pdf(pkg['data'], pkg), f"Data_{c_id}.pdf")
     with r3: st.download_button("⬇ Confirm CSV", generate_confirm_consignment_csv(pkg['data']), f"Confirm_{c_id}.csv")
-    
     r4, r5 = st.columns(2)
     with r4: st.download_button("⬇ Bartender", generate_bartender_full(pkg['data']), f"Bartender_{c_id}.xlsx")
     with r5: st.download_button("⬇ Ewaybill", generate_excel_simple(pkg['data'], ['SKU Id', 'Editable Qty', 'Cost Price'], f"Eway_{c_id}.xlsx"), f"Eway_{c_id}.xlsx")
-    
     st.divider(); st.subheader("Labels & Printing")
     uc1, uc2 = st.columns([1, 1])
     with uc1:
@@ -581,9 +479,10 @@ elif st.session_state['page'] == 'view_saved':
     with uc2:
         if os.path.exists(get_merged_labels_path(c_id)):
             with open(get_merged_labels_path(c_id), "rb") as f: st.download_button("⬇ Download Merged PDF", f, f"Merged_{c_id}.pdf")
-            st.divider()
+            st.divider(); 
             if st.button("🖨️ SCAN & PRINT", type="primary", use_container_width=True): nav('scan_print')
-    
     st.divider(); 
     with st.expander("Danger Zone"):
-        if st.button(f"Delete {c_id}"): st.session_state['consignments']=[c for c in st.session_state['consignments'] if c['id']!=c_id]; save_history(st.session_state['consignments']); nav('home')
+        if st.button(f"Delete {c_id}"): 
+            st.session_state['consignments']=[c for c in st.session_state['consignments'] if c['id']!=c_id]
+            save_history(st.session_state['consignments']); nav('home')
