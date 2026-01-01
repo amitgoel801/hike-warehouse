@@ -58,17 +58,21 @@ with st.sidebar:
     
     st.divider()
     st.header("🖨️ Printing Mode")
-    # Auto-select default based on environment
-    default_mode = "Local (Direct USB)" if HAS_WIN32 else "Web (Browser Kiosk)"
-    print_mode = st.radio("Select Method:", ["Local (Direct USB)", "Web (Browser Kiosk)"], index=0 if HAS_WIN32 else 1)
+    
+    # 3 Options now
+    options = ["Local (Direct USB)", "Web (QZ Tray / Kiosk)", "Normal Print (Browser Popup)"]
+    # Default index depends on environment
+    idx = 0 if HAS_WIN32 else 2 
+    
+    print_mode = st.radio("Select Method:", options, index=idx)
     
     if print_mode == "Local (Direct USB)":
-        if not HAS_WIN32:
-            st.error("❌ 'pywin32' missing. Cannot use Local mode.")
-        else:
-            st.success("✅ Connected to Windows Spooler")
+        if not HAS_WIN32: st.error("❌ 'pywin32' missing. Cannot use Local mode.")
+        else: st.success("✅ Connected to Windows Spooler")
+    elif print_mode == "Web (QZ Tray / Kiosk)":
+        st.info("ℹ️ Best for fast, silent printing (Requires QZ Tray).")
     else:
-        st.info("ℹ️ Requires Chrome Kiosk Mode for silent printing.")
+        st.info("ℹ️ Opens standard print dialog. No setup required.")
 
 # --- FILE PATHS ---
 CACHE_FILE = "master_data.csv"
@@ -97,9 +101,58 @@ def print_local_windows(pdf_path, printer_name):
     except Exception as e:
         return False, str(e)
 
-# 2. WEB BROWSER PRINTING (JS Injection)
-def trigger_browser_print(pdf_bytes):
+# 2. QZ TRAY PRINTING (Silent JS Injection)
+def trigger_qz_print(pdf_bytes, printer_name):
     base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
+    qz_script = f"""
+    <html>
+    <head><script src="https://cdn.jsdelivr.net/npm/qz-tray@2.2.4/qz-tray.min.js"></script></head>
+    <body>
+        <script>
+            var printerName = "{printer_name}";
+            var pdfData = "{base64_pdf}";
+            qz.websocket.connect().then(function() {{
+                return qz.printers.find(printerName ? printerName : undefined);
+            }}).then(function(printer) {{
+                var config = qz.configs.create(printer);
+                var data = [{{ type: 'pixel', format: 'pdf', flavor: 'base64', data: pdfData }}];
+                return qz.print(config, data);
+            }}).then(function() {{
+                return qz.websocket.disconnect();
+            }}).catch(function(e) {{
+                console.error(e);
+                alert("QZ Tray Error: " + e);
+            }});
+        </script>
+    </body>
+    </html>
+    """
+    components.html(qz_script, height=0, width=0)
+
+def list_printers_js():
+    js = """
+    <html>
+    <head><script src="https://cdn.jsdelivr.net/npm/qz-tray@2.2.4/qz-tray.min.js"></script></head>
+    <body>
+        <script>
+            qz.websocket.connect().then(function() {
+                return qz.printers.find();
+            }).then(function(printers) {
+                alert("Available Printers:\\n" + printers.join("\\n"));
+                return qz.websocket.disconnect();
+            }).catch(function(e) {
+                alert("Error: " + e);
+            });
+        </script>
+    </body>
+    </html>
+    """
+    components.html(js, height=0, width=0)
+
+# 3. NORMAL BROWSER POPUP PRINTING
+def trigger_normal_popup_print(pdf_bytes):
+    base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
+    # Simple iframe, standard window.print()
     pdf_display = f"""
         <iframe src="data:application/pdf;base64,{base64_pdf}" 
                 id="pdf_frame" 
@@ -186,7 +239,7 @@ def extract_box_pdf_page(merged_pdf_path, box_index):
         return output_bytes.getvalue(), writer
     except: return None, None
 
-# --- GENERATORS (Compact) ---
+# --- GENERATORS ---
 def generate_confirm_consignment_csv(df):
     output = io.BytesIO()
     sorted_df = df.sort_values(by='SKU Id')
@@ -306,9 +359,15 @@ if st.session_state['page'] == 'home':
     if c1.button("🛒 Flipkart", use_container_width=True): st.session_state['current_channel']='Flipkart'; nav('channel')
     if c2.button("📦 Amazon", use_container_width=True): st.session_state['current_channel']='Amazon'; nav('channel')
     if c3.button("🛍️ Myntra", use_container_width=True): st.session_state['current_channel']='Myntra'; nav('channel')
+    
     with st.sidebar:
-        st.header("Settings"); 
-        if st.button("🔄 Sync Data"): s, m = sync_data(); st.success(m) if s else st.error(m)
+        st.header("Settings")
+        # FIX: Unwrap logic error
+        if st.button("🔄 Sync Data"):
+            s, m = sync_data()
+            if s: st.success(m)
+            else: st.error(m)
+    
     st.divider()
     with st.expander("📂 View History"):
         if st.session_state['consignments']:
@@ -349,9 +408,26 @@ elif st.session_state['page'] == 'add':
     if uploaded and c_id and s_sel != "+ Add New":
         if st.button("Process"):
             if c_id in [c['id'] for c in st.session_state['consignments']]: st.error("ID exists!"); st.stop()
-            df_m = load_master_data(); 
+            
+            df_m = load_master_data()
             if df_m.empty: st.error("Sync Data!"); st.stop()
+            
             df_raw = pd.read_csv(uploaded); uploaded.seek(0); df_c = pd.read_csv(uploaded)
+            
+            # --- VALIDATION STEP ---
+            # Check if all SKU Ids in CSV exist in Master Data
+            csv_skus = set(df_c['SKU Id'].astype(str))
+            master_skus = set(df_m['SKU'].astype(str))
+            
+            missing_skus = [sku for sku in csv_skus if sku not in master_skus]
+            
+            if missing_skus:
+                st.error("❌ CRITICAL ERROR: The following SKUs are missing from Master Data:")
+                st.dataframe(pd.DataFrame(missing_skus, columns=["Missing SKUs"]), use_container_width=True)
+                st.error("Please add these SKUs to Master Data (Sync) before processing. Processing Stopped.")
+                st.stop()
+            # -----------------------
+
             merged = pd.merge(df_c, df_m, left_on='SKU Id', right_on='SKU', how='left')
             merged['Editable Qty'] = merged['Quantity Sent'].fillna(0); merged['PPCN'] = pd.to_numeric(merged['PPCN'], errors='coerce').fillna(1)
             merged['Editable Boxes'] = (merged['Editable Qty'] / merged['PPCN']).apply(lambda x: float(x)).round(2)
@@ -401,8 +477,12 @@ elif st.session_state['page'] == 'scan_print':
                 else: st.error(msg); return False
             else: st.warning("Select printer!"); return False
 
-        else: # Web Mode
-            st.session_state['web_print_trigger'] = bytes_data # Trigger JS
+        elif print_mode == "Web (QZ Tray / Kiosk)":
+            st.session_state['web_print_trigger'] = bytes_data # Trigger QZ JS
+            return True
+            
+        else: # Normal Print (Browser Popup)
+            st.session_state['normal_print_trigger'] = bytes_data # Trigger Normal JS
             return True
 
     def process_scan():
@@ -440,16 +520,24 @@ elif st.session_state['page'] == 'scan_print':
             printers = get_windows_printers()
             if 'selected_printer_local' not in st.session_state: st.session_state['selected_printer_local'] = printers[0] if printers else None
             st.selectbox("Select Printer", printers, key='selected_printer_local', label_visibility="collapsed")
+        elif print_mode == "Web (QZ Tray / Kiosk)":
+            if 'qz_printer_name' not in st.session_state: st.session_state['qz_printer_name'] = ""
+            st.text_input("Exact Printer Name", key='qz_printer_name', placeholder="Printer Name for QZ Tray")
+            if st.button("Show My Printers"): list_printers_js()
         else:
-            st.caption("🌐 Using Browser Kiosk Mode")
+            st.caption("ℹ️ Standard Browser Popup Mode")
 
     st.divider()
     st.text_input("SCAN BARCODE", key='scan_input', on_change=process_scan)
 
-    # --- WEB PRINT TRIGGER ---
+    # --- PRINT TRIGGERS ---
     if 'web_print_trigger' in st.session_state:
-        trigger_browser_print(st.session_state['web_print_trigger'])
+        trigger_qz_print(st.session_state['web_print_trigger'], st.session_state.get('qz_printer_name', ""))
         del st.session_state['web_print_trigger']
+    
+    if 'normal_print_trigger' in st.session_state:
+        trigger_normal_popup_print(st.session_state['normal_print_trigger'])
+        del st.session_state['normal_print_trigger']
 
     last_p = st.session_state.get('last_printed_box')
     if last_p: st.info(f"🖨️ Sent to Printer: **BOX {last_p}**", icon="✨")
