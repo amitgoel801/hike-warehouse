@@ -21,8 +21,6 @@ st.set_page_config(page_title="Hike Warehouse Manager", layout="wide")
 
 # --- DATABASE CONNECTION (GOOGLE SHEETS) ---
 def get_db_connection():
-    # Requires st.secrets to be set up on Streamlit Cloud
-    # If running locally without secrets, this will fail gracefully or need a local json file
     try:
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
         creds_dict = dict(st.secrets["gcp_service_account"])
@@ -31,7 +29,7 @@ def get_db_connection():
         sheet_url = st.secrets["database"]["sheet_url"]
         return client.open_by_url(sheet_url)
     except Exception as e:
-        st.error(f"Database Connection Error: {e}. Check your Secrets.")
+        st.error(f"Database Connection Error: {e}")
         st.stop()
 
 # --- AUTHENTICATION (PERSISTENT) ---
@@ -41,7 +39,6 @@ def load_users():
         ws = sh.worksheet("Users")
         data = ws.get_all_records()
         if not data: return {"admin": "admin123"} 
-        # Convert all to strings to avoid type issues
         return {str(row['username']): str(row['password']) for row in data}
     except: return {"admin": "admin123"}
 
@@ -81,8 +78,6 @@ with st.sidebar:
 
     st.divider()
     st.header("🖨️ Printing Mode")
-    
-    # Updated 3 Options
     print_mode = st.radio("Select Method:", 
                           ["Web (QZ Tray / Kiosk)", "Normal Print (Browser Popup)", "Local (Direct USB)"], 
                           index=1)
@@ -90,9 +85,9 @@ with st.sidebar:
     if print_mode == "Web (QZ Tray / Kiosk)":
         st.info("Silent printing via QZ Tray.")
     elif print_mode == "Normal Print (Browser Popup)":
-        st.info("Opens standard print dialog (PDF).")
+        st.info("Opens standard print dialog.")
     else:
-        st.info("Requires Windows Server + USB connection.")
+        st.info("Requires Windows Server.")
 
 # --- FILE PATHS (Local Temp Storage) ---
 FILES_DIR = "consignment_files"
@@ -101,32 +96,67 @@ SHEET_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRdLEddTZgmuUSswPp3
 
 if not os.path.exists(FILES_DIR): os.makedirs(FILES_DIR)
 
-# --- PERMANENT DATA MANAGERS (GOOGLE SHEETS) ---
+# --- PERMANENT DATA MANAGERS (CHUNKED STORAGE FIX) ---
 def load_history():
     try:
-        sh = get_db_connection(); ws = sh.worksheet("History")
-        records = ws.get_all_records()
+        sh = get_db_connection()
+        ws = sh.worksheet("History")
+        all_rows = ws.get_all_values()
+        
+        if not all_rows or len(all_rows) < 2: return [] # Empty
+        
         history = []
-        for r in records:
-            if not r['data_json']: continue
-            con_obj = json.loads(r['data_json'])
-            if 'data' in con_obj: con_obj['data'] = pd.DataFrame(con_obj['data'])
-            if 'original_data' in con_obj: con_obj['original_data'] = pd.DataFrame(con_obj['original_data'])
-            history.append(con_obj)
+        # Skip Header (Row 0)
+        for row in all_rows[1:]:
+            # Row structure: [ID, Date, Channel, Chunk1, Chunk2, ...]
+            # Join all chunks starting from column index 3 (Column D)
+            json_str = "".join([cell for cell in row[3:] if cell])
+            
+            if not json_str: continue
+            
+            try:
+                con_obj = json.loads(json_str)
+                # Rebuild DataFrames
+                if 'data' in con_obj: con_obj['data'] = pd.DataFrame(con_obj['data'])
+                if 'original_data' in con_obj: con_obj['original_data'] = pd.DataFrame(con_obj['original_data'])
+                history.append(con_obj)
+            except: pass
+            
         return history
-    except: return []
+    except Exception as e:
+        return []
 
 def save_history(history_list):
     try:
-        sh = get_db_connection(); ws = sh.worksheet("History"); ws.clear()
-        rows = [["id", "date", "channel", "data_json"]]
+        sh = get_db_connection()
+        ws = sh.worksheet("History")
+        ws.clear()
+        
+        # Prepare Rows
+        rows = [["id", "date", "channel", "data_chunks"]]
+        
         for h in history_list:
             h_copy = h.copy()
-            if 'data' in h_copy and isinstance(h_copy['data'], pd.DataFrame): h_copy['data'] = h_copy['data'].to_dict('records')
-            if 'original_data' in h_copy and isinstance(h_copy['original_data'], pd.DataFrame): h_copy['original_data'] = h_copy['original_data'].to_dict('records')
-            rows.append([h['id'], h['date'], h['channel'], json.dumps(h_copy)])
+            # Convert DF to Dict
+            if 'data' in h_copy and isinstance(h_copy['data'], pd.DataFrame): 
+                h_copy['data'] = h_copy['data'].to_dict('records')
+            if 'original_data' in h_copy and isinstance(h_copy['original_data'], pd.DataFrame): 
+                h_copy['original_data'] = h_copy['original_data'].to_dict('records')
+            
+            # Convert to JSON String
+            full_json = json.dumps(h_copy)
+            
+            # CHUNKING LOGIC: Split string into 45,000 char blocks
+            chunk_size = 45000
+            chunks = [full_json[i:i+chunk_size] for i in range(0, len(full_json), chunk_size)]
+            
+            # Create Row: [ID, Date, Channel, Chunk1, Chunk2...]
+            row_data = [h['id'], h['date'], h['channel']] + chunks
+            rows.append(row_data)
+            
         ws.update(rows)
-    except Exception as e: st.error(f"Save Error: {e}")
+    except Exception as e:
+        st.error(f"Save Error: {e}")
 
 def load_address_data(sheet_name, default_cols):
     try:
@@ -187,7 +217,6 @@ def trigger_qz_print(pdf_bytes, printer_name):
 # 2. Normal Browser Popup Logic
 def trigger_normal_popup_print(pdf_bytes):
     base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
-    # Embeds PDF and calls window.print()
     pdf_display = f"""<iframe src="data:application/pdf;base64,{base64_pdf}" id="pdf_frame" style="position:absolute; top:-10000px; left:-10000px; width:1px; height:1px;"></iframe>
     <script>setTimeout(function() {{ var frame = document.getElementById('pdf_frame'); frame.contentWindow.focus(); frame.contentWindow.print(); }}, 1000);</script>"""
     components.html(pdf_display, height=0, width=0)
