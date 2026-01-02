@@ -6,3 +6,4 @@ openpyxl
 xlsxwriter
 gspread
 oauth2client
+extra-streamlit-components
