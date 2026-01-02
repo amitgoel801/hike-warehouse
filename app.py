@@ -16,6 +16,14 @@ from reportlab.lib import colors
 from reportlab.pdfgen import canvas
 from pypdf import PdfReader, PdfWriter, Transformation, PageObject
 
+# --- WINDOWS PRINTING DETECTION (Optional Fallback) ---
+try:
+    import win32print
+    import win32api
+    HAS_WIN32 = True
+except ImportError:
+    HAS_WIN32 = False
+
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Hike Warehouse Manager", layout="wide")
 
@@ -78,16 +86,18 @@ with st.sidebar:
 
     st.divider()
     st.header("🖨️ Printing Mode")
-    print_mode = st.radio("Select Method:", 
-                          ["Web (QZ Tray / Kiosk)", "Normal Print (Browser Popup)", "Local (Direct USB)"], 
-                          index=1)
     
-    if print_mode == "Web (QZ Tray / Kiosk)":
-        st.info("Silent printing via QZ Tray.")
-    elif print_mode == "Normal Print (Browser Popup)":
-        st.info("Opens standard print dialog.")
+    # Modes: Browser Kiosk (Default) OR Local USB (if available)
+    options = ["Browser Kiosk (Silent)", "Local (Direct USB)"]
+    idx = 0 
+    
+    print_mode = st.radio("Select Method:", options, index=idx)
+    
+    if print_mode == "Browser Kiosk (Silent)":
+        st.info("Uses Chrome Kiosk Mode. Prints to default printer.")
     else:
-        st.info("Requires Windows Server.")
+        if HAS_WIN32: st.success("✅ Connected to Windows Spooler")
+        else: st.error("❌ Windows API missing. Use Browser Kiosk.")
 
 # --- FILE PATHS (Local Temp Storage) ---
 FILES_DIR = "consignment_files"
@@ -96,67 +106,45 @@ SHEET_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRdLEddTZgmuUSswPp3
 
 if not os.path.exists(FILES_DIR): os.makedirs(FILES_DIR)
 
-# --- PERMANENT DATA MANAGERS (CHUNKED STORAGE FIX) ---
+# --- PERMANENT DATA MANAGERS (GOOGLE SHEETS CHUNKING) ---
 def load_history():
     try:
         sh = get_db_connection()
         ws = sh.worksheet("History")
         all_rows = ws.get_all_values()
         
-        if not all_rows or len(all_rows) < 2: return [] # Empty
+        if not all_rows or len(all_rows) < 2: return []
         
         history = []
-        # Skip Header (Row 0)
         for row in all_rows[1:]:
-            # Row structure: [ID, Date, Channel, Chunk1, Chunk2, ...]
-            # Join all chunks starting from column index 3 (Column D)
+            # Join chunks from col 3 onwards
             json_str = "".join([cell for cell in row[3:] if cell])
-            
             if not json_str: continue
-            
             try:
                 con_obj = json.loads(json_str)
-                # Rebuild DataFrames
                 if 'data' in con_obj: con_obj['data'] = pd.DataFrame(con_obj['data'])
                 if 'original_data' in con_obj: con_obj['original_data'] = pd.DataFrame(con_obj['original_data'])
                 history.append(con_obj)
             except: pass
-            
         return history
-    except Exception as e:
-        return []
+    except: return []
 
 def save_history(history_list):
     try:
-        sh = get_db_connection()
-        ws = sh.worksheet("History")
-        ws.clear()
-        
-        # Prepare Rows
+        sh = get_db_connection(); ws = sh.worksheet("History"); ws.clear()
         rows = [["id", "date", "channel", "data_chunks"]]
-        
         for h in history_list:
             h_copy = h.copy()
-            # Convert DF to Dict
-            if 'data' in h_copy and isinstance(h_copy['data'], pd.DataFrame): 
-                h_copy['data'] = h_copy['data'].to_dict('records')
-            if 'original_data' in h_copy and isinstance(h_copy['original_data'], pd.DataFrame): 
-                h_copy['original_data'] = h_copy['original_data'].to_dict('records')
+            if 'data' in h_copy and isinstance(h_copy['data'], pd.DataFrame): h_copy['data'] = h_copy['data'].to_dict('records')
+            if 'original_data' in h_copy and isinstance(h_copy['original_data'], pd.DataFrame): h_copy['original_data'] = h_copy['original_data'].to_dict('records')
             
-            # Convert to JSON String
             full_json = json.dumps(h_copy)
-            
-            # CHUNKING LOGIC: Split string into 45,000 char blocks
+            # Chunking 45k chars
             chunk_size = 45000
             chunks = [full_json[i:i+chunk_size] for i in range(0, len(full_json), chunk_size)]
-            
-            # Create Row: [ID, Date, Channel, Chunk1, Chunk2...]
-            row_data = [h['id'], h['date'], h['channel']] + chunks
-            rows.append(row_data)
-            
+            rows.append([h['id'], h['date'], h['channel']] + chunks)
         ws.update(rows)
-    except Exception as e:
-        st.error(f"Save Error: {e}")
+    except Exception as e: st.error(f"Save Error: {e}")
 
 def load_address_data(sheet_name, default_cols):
     try:
@@ -203,28 +191,41 @@ def extract_box_pdf_page(merged_pdf_path, box_index):
         return output_bytes.getvalue(), writer
     except: return None, None
 
-# 1. QZ Tray Logic
-def trigger_qz_print(pdf_bytes, printer_name):
+# 1. BROWSER PRINT TRIGGER (THE "MAGIC" FUNCTION)
+def trigger_browser_print(pdf_bytes):
+    """
+    Embeds the PDF and calls window.print(). 
+    If Chrome Kiosk mode is active, this prints silently.
+    """
     base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
-    qz_script = f"""<html><head><script src="https://cdn.jsdelivr.net/npm/qz-tray@2.2.4/qz-tray.min.js"></script></head><body><script>
-        var printerName = "{printer_name}"; var pdfData = "{base64_pdf}";
-        qz.websocket.connect().then(function() {{ return qz.printers.find(printerName ? printerName : undefined); }})
-        .then(function(printer) {{ var config = qz.configs.create(printer); var data = [{{ type: 'pixel', format: 'pdf', flavor: 'base64', data: pdfData }}]; return qz.print(config, data); }})
-        .then(function() {{ return qz.websocket.disconnect(); }}).catch(function(e) {{ alert("QZ Error: " + e); }});
-    </script></body></html>"""
-    components.html(qz_script, height=0, width=0)
-
-# 2. Normal Browser Popup Logic
-def trigger_normal_popup_print(pdf_bytes):
-    base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
-    pdf_display = f"""<iframe src="data:application/pdf;base64,{base64_pdf}" id="pdf_frame" style="position:absolute; top:-10000px; left:-10000px; width:1px; height:1px;"></iframe>
-    <script>setTimeout(function() {{ var frame = document.getElementById('pdf_frame'); frame.contentWindow.focus(); frame.contentWindow.print(); }}, 1000);</script>"""
+    pdf_display = f"""
+        <iframe src="data:application/pdf;base64,{base64_pdf}" 
+                id="pdf_frame" 
+                style="position:absolute; top:-10000px; left:-10000px; width:1px; height:1px;">
+        </iframe>
+        <script>
+            setTimeout(function() {{
+                var frame = document.getElementById('pdf_frame');
+                frame.contentWindow.focus();
+                frame.contentWindow.print();
+            }}, 800);  // 800ms delay to ensure PDF loads
+        </script>
+    """
     components.html(pdf_display, height=0, width=0)
 
-def list_printers_js():
-    js = """<html><head><script src="https://cdn.jsdelivr.net/npm/qz-tray@2.2.4/qz-tray.min.js"></script></head><body><script>
-    qz.websocket.connect().then(function() {{ return qz.printers.find(); }}).then(function(printers) {{ alert("Printers:\\n" + printers.join("\\n")); return qz.websocket.disconnect(); }});</script></body></html>"""
-    components.html(js, height=0, width=0)
+# 2. LOCAL PRINT (Legacy Support)
+def print_local_windows(pdf_path, printer_name):
+    try:
+        win32api.ShellExecute(0, "printto", pdf_path, f'"{printer_name}"', ".", 0)
+        return True, "Sent to Local Printer"
+    except Exception as e:
+        return False, str(e)
+def get_windows_printers():
+    if not HAS_WIN32: return []
+    try:
+        printers = win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS)
+        return [p[2] for p in printers]
+    except: return ["Default"]
 
 # --- GENERATORS (PDFs) ---
 def generate_confirm_consignment_csv(df):
@@ -381,13 +382,11 @@ elif st.session_state['page'] == 'add':
             csv_skus = set(df_c['SKU Id'].astype(str))
             master_skus = set(df_m['SKU'].astype(str))
             missing = [s for s in csv_skus if s not in master_skus]
-            
             if missing:
                 st.error("🚨 STOP! Found SKUs in file that are NOT in Master Data:")
                 st.dataframe(pd.DataFrame(missing, columns=["Missing SKU IDs"]), use_container_width=True)
                 st.error("Please add these to Master Data and Sync before proceeding.")
                 st.stop()
-            # -------------------------------
 
             merged = pd.merge(df_c, df_m, left_on='SKU Id', right_on='SKU', how='left')
             merged['Editable Qty'] = merged['Quantity Sent'].fillna(0); merged['PPCN'] = pd.to_numeric(merged['PPCN'], errors='coerce').fillna(1)
@@ -421,14 +420,23 @@ elif st.session_state['page'] == 'scan_print':
         bytes_data, writer = extract_box_pdf_page(merged_pdf_path, int(box_num)-1)
         if not bytes_data: st.error("PDF Error"); return False
         
-        if print_mode == "Web (QZ Tray / Kiosk)":
+        if print_mode == "Browser Kiosk (Silent)":
             st.session_state['web_print_trigger'] = bytes_data
             return True
-        elif print_mode == "Normal Print (Browser Popup)":
-            st.session_state['normal_print_trigger'] = bytes_data
-            return True
+        elif print_mode == "Local (Direct USB)":
+            if not HAS_WIN32: st.error("Local Mode requires Windows + pywin32"); return False
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                writer.write(tmp); tmp_path = tmp.name
+            printer = st.session_state.get('selected_printer_local')
+            if printer:
+                success, msg = print_local_windows(tmp_path, printer)
+                time.sleep(1) # Wait for spool
+                try: os.remove(tmp_path) 
+                except: pass
+                if success: return True
+                else: st.error(msg); return False
+            else: st.warning("Select local printer!"); return False
         else:
-            st.error("Local printing not supported in Cloud Mode.")
             return False
 
     def process_scan():
@@ -458,19 +466,17 @@ elif st.session_state['page'] == 'scan_print':
         if st.button("🔙 Back", use_container_width=True): nav('view_saved')
     
     with c_pr:
-        if print_mode == "Web (QZ Tray / Kiosk)":
-            if 'qz_printer_name' not in st.session_state: st.session_state['qz_printer_name'] = ""
-            st.text_input("Exact Printer Name", key='qz_printer_name', placeholder="Printer Name for QZ Tray")
-            if st.button("Show My Printers"): list_printers_js()
-        elif print_mode == "Normal Print (Browser Popup)":
-            st.caption("🌐 Using Browser Popup (Ctrl+P behavior)")
+        if print_mode == "Local (Direct USB)":
+            printers = get_windows_printers()
+            if 'selected_printer_local' not in st.session_state: st.session_state['selected_printer_local'] = printers[0] if printers else None
+            st.selectbox("Select Printer", printers, key='selected_printer_local', label_visibility="collapsed")
+        else:
+            st.caption("🌐 Using Chrome Kiosk Mode")
 
     st.divider(); st.text_input("SCAN BARCODE", key='scan_input', on_change=process_scan)
 
     if 'web_print_trigger' in st.session_state:
-        trigger_qz_print(st.session_state['web_print_trigger'], st.session_state.get('qz_printer_name', "")); del st.session_state['web_print_trigger']
-    if 'normal_print_trigger' in st.session_state:
-        trigger_normal_popup_print(st.session_state['normal_print_trigger']); del st.session_state['normal_print_trigger']
+        trigger_browser_print(st.session_state['web_print_trigger']); del st.session_state['web_print_trigger']
 
     last_p = st.session_state.get('last_printed_box')
     if last_p: st.info(f"🖨️ Sent to Printer: **BOX {last_p}**", icon="✨")
