@@ -16,14 +16,6 @@ from reportlab.lib import colors
 from reportlab.pdfgen import canvas
 from pypdf import PdfReader, PdfWriter, Transformation, PageObject
 
-# --- WINDOWS PRINTING DETECTION (Optional Fallback) ---
-try:
-    import win32print
-    import win32api
-    HAS_WIN32 = True
-except ImportError:
-    HAS_WIN32 = False
-
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Hike Warehouse Manager", layout="wide")
 
@@ -40,7 +32,7 @@ def get_db_connection():
         st.error(f"Database Connection Error: {e}")
         st.stop()
 
-# --- AUTHENTICATION (PERSISTENT) ---
+# --- AUTHENTICATION ---
 def load_users():
     try:
         sh = get_db_connection()
@@ -87,26 +79,26 @@ with st.sidebar:
     st.divider()
     st.header("🖨️ Printing Mode")
     
-    # Modes: Browser Kiosk (Default) OR Local USB (if available)
-    options = ["Browser Kiosk (Silent)", "Local (Direct USB)"]
-    idx = 0 
+    print_mode = st.radio("Select Method:", 
+                          ["Web (Browser Kiosk)", "Normal Print (Popup)", "Local (Direct USB)"], 
+                          index=0)
     
-    print_mode = st.radio("Select Method:", options, index=idx)
-    
-    if print_mode == "Browser Kiosk (Silent)":
-        st.info("Uses Chrome Kiosk Mode. Prints to default printer.")
+    if print_mode == "Web (Browser Kiosk)":
+        st.info("Silent printing. Requires Chrome Kiosk shortcut.")
+    elif print_mode == "Normal Print (Popup)":
+        st.info("Standard browser print dialog (Ctrl+P behavior).")
     else:
-        if HAS_WIN32: st.success("✅ Connected to Windows Spooler")
-        else: st.error("❌ Windows API missing. Use Browser Kiosk.")
+        if HAS_WIN32: st.success("Windows Spooler Ready")
+        else: st.warning("Requires Windows Server")
 
-# --- FILE PATHS (Local Temp Storage) ---
+# --- FILE PATHS ---
 FILES_DIR = "consignment_files"
 CACHE_FILE = "master_data.csv" 
 SHEET_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRdLEddTZgmuUSswPp3A_HM7DGH8UCUWEmqd-cIbbJ7nb_Eq4YvZxO0vjWESlxX-9Y6VWRcVLPFlIVp/pub?gid=0&single=true&output=csv"
 
 if not os.path.exists(FILES_DIR): os.makedirs(FILES_DIR)
 
-# --- PERMANENT DATA MANAGERS (GOOGLE SHEETS CHUNKING) ---
+# --- PERMANENT DATA MANAGERS (CHUNKED STORAGE) ---
 def load_history():
     try:
         sh = get_db_connection()
@@ -116,12 +108,14 @@ def load_history():
         if not all_rows or len(all_rows) < 2: return []
         
         history = []
+        # Skip Header (Row 0)
         for row in all_rows[1:]:
-            # Join chunks from col 3 onwards
+            # Join chunks from col 3 onwards (Cols D, E, F...)
             json_str = "".join([cell for cell in row[3:] if cell])
             if not json_str: continue
             try:
                 con_obj = json.loads(json_str)
+                # Rebuild DataFrames
                 if 'data' in con_obj: con_obj['data'] = pd.DataFrame(con_obj['data'])
                 if 'original_data' in con_obj: con_obj['original_data'] = pd.DataFrame(con_obj['original_data'])
                 history.append(con_obj)
@@ -131,20 +125,32 @@ def load_history():
 
 def save_history(history_list):
     try:
-        sh = get_db_connection(); ws = sh.worksheet("History"); ws.clear()
+        sh = get_db_connection()
+        ws = sh.worksheet("History")
+        ws.clear()
+        
+        # Prepare Rows [ID, Date, Channel, Chunk1, Chunk2...]
         rows = [["id", "date", "channel", "data_chunks"]]
+        
         for h in history_list:
             h_copy = h.copy()
-            if 'data' in h_copy and isinstance(h_copy['data'], pd.DataFrame): h_copy['data'] = h_copy['data'].to_dict('records')
-            if 'original_data' in h_copy and isinstance(h_copy['original_data'], pd.DataFrame): h_copy['original_data'] = h_copy['original_data'].to_dict('records')
+            # Serialize DFs
+            if 'data' in h_copy and isinstance(h_copy['data'], pd.DataFrame): 
+                h_copy['data'] = h_copy['data'].to_dict('records')
+            if 'original_data' in h_copy and isinstance(h_copy['original_data'], pd.DataFrame): 
+                h_copy['original_data'] = h_copy['original_data'].to_dict('records')
             
             full_json = json.dumps(h_copy)
-            # Chunking 45k chars
-            chunk_size = 45000
+            
+            # Chunk split (40k chars to be safe under 50k limit)
+            chunk_size = 40000
             chunks = [full_json[i:i+chunk_size] for i in range(0, len(full_json), chunk_size)]
+            
             rows.append([h['id'], h['date'], h['channel']] + chunks)
+            
         ws.update(rows)
-    except Exception as e: st.error(f"Save Error: {e}")
+    except Exception as e:
+        st.error(f"Save Error (History): {e}")
 
 def load_address_data(sheet_name, default_cols):
     try:
@@ -191,11 +197,11 @@ def extract_box_pdf_page(merged_pdf_path, box_index):
         return output_bytes.getvalue(), writer
     except: return None, None
 
-# 1. BROWSER PRINT TRIGGER (THE "MAGIC" FUNCTION)
+# BROWSER PRINT TRIGGER
 def trigger_browser_print(pdf_bytes):
     """
     Embeds the PDF and calls window.print(). 
-    If Chrome Kiosk mode is active, this prints silently.
+    Works for both Kiosk (Silent) and Normal (Popup) modes.
     """
     base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
     pdf_display = f"""
@@ -208,24 +214,10 @@ def trigger_browser_print(pdf_bytes):
                 var frame = document.getElementById('pdf_frame');
                 frame.contentWindow.focus();
                 frame.contentWindow.print();
-            }}, 800);  // 800ms delay to ensure PDF loads
+            }}, 800); 
         </script>
     """
     components.html(pdf_display, height=0, width=0)
-
-# 2. LOCAL PRINT (Legacy Support)
-def print_local_windows(pdf_path, printer_name):
-    try:
-        win32api.ShellExecute(0, "printto", pdf_path, f'"{printer_name}"', ".", 0)
-        return True, "Sent to Local Printer"
-    except Exception as e:
-        return False, str(e)
-def get_windows_printers():
-    if not HAS_WIN32: return []
-    try:
-        printers = win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS)
-        return [p[2] for p in printers]
-    except: return ["Default"]
 
 # --- GENERATORS (PDFs) ---
 def generate_confirm_consignment_csv(df):
@@ -289,14 +281,23 @@ def generate_consignment_data_pdf(df, c_details):
     elements.append(table); doc.build(elements); return buffer.getvalue()
 
 def generate_bartender_full(df):
-    output = io.BytesIO(); master_df = load_master_data()
-    export_df = pd.merge(df[['SKU Id', 'Editable Qty']], master_df, left_on='SKU Id', right_on='SKU', how='left')
-    export_df['QTY'] = export_df['Editable Qty']; export_df = export_df.drop(columns=['SKU Id', 'Editable Qty'], errors='ignore')
-    if 'EAN' in export_df.columns: export_df['EAN'] = export_df['EAN'].astype(str).str.replace(r'\.0$', '', regex=True)
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        export_df.to_excel(writer, index=False); workbook = writer.book; worksheet = writer.sheets['Sheet1']
-        if 'EAN' in export_df.columns: worksheet.set_column(export_df.columns.get_loc('EAN'), export_df.columns.get_loc('EAN'), 20, workbook.add_format({'num_format': '@'}))
-    return output.getvalue()
+    try:
+        output = io.BytesIO(); master_df = load_master_data()
+        if master_df.empty: return None
+        
+        # Ensure SKU Id exists
+        if 'SKU Id' not in df.columns: return None
+        
+        export_df = pd.merge(df[['SKU Id', 'Editable Qty']], master_df, left_on='SKU Id', right_on='SKU', how='left')
+        export_df['QTY'] = export_df['Editable Qty']; export_df = export_df.drop(columns=['SKU Id', 'Editable Qty'], errors='ignore')
+        
+        if 'EAN' in export_df.columns: export_df['EAN'] = export_df['EAN'].astype(str).str.replace(r'\.0$', '', regex=True)
+        
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            export_df.to_excel(writer, index=False); workbook = writer.book; worksheet = writer.sheets['Sheet1']
+            if 'EAN' in export_df.columns: worksheet.set_column(export_df.columns.get_loc('EAN'), export_df.columns.get_loc('EAN'), 20, workbook.add_format({'num_format': '@'}))
+        return output.getvalue()
+    except: return None
 
 def generate_excel_simple(df, cols, filename):
     output = io.BytesIO(); temp_df = df.copy(); temp_df['Qty']=temp_df.get('Editable Qty',0); temp_df['Boxes']=temp_df.get('Editable Boxes',0)
@@ -378,10 +379,16 @@ elif st.session_state['page'] == 'add':
             if df_m.empty: st.error("Sync Data!"); st.stop()
             df_raw = pd.read_csv(uploaded); uploaded.seek(0); df_c = pd.read_csv(uploaded)
             
+            # Auto-strip whitespace from headers and values
+            df_c.columns = df_c.columns.str.strip()
+            if 'SKU Id' in df_c.columns:
+                df_c['SKU Id'] = df_c['SKU Id'].astype(str).str.strip()
+            
             # --- CRITICAL SKU VALIDATION ---
             csv_skus = set(df_c['SKU Id'].astype(str))
             master_skus = set(df_m['SKU'].astype(str))
             missing = [s for s in csv_skus if s not in master_skus]
+            
             if missing:
                 st.error("🚨 STOP! Found SKUs in file that are NOT in Master Data:")
                 st.dataframe(pd.DataFrame(missing, columns=["Missing SKU IDs"]), use_container_width=True)
@@ -420,24 +427,8 @@ elif st.session_state['page'] == 'scan_print':
         bytes_data, writer = extract_box_pdf_page(merged_pdf_path, int(box_num)-1)
         if not bytes_data: st.error("PDF Error"); return False
         
-        if print_mode == "Browser Kiosk (Silent)":
-            st.session_state['web_print_trigger'] = bytes_data
-            return True
-        elif print_mode == "Local (Direct USB)":
-            if not HAS_WIN32: st.error("Local Mode requires Windows + pywin32"); return False
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                writer.write(tmp); tmp_path = tmp.name
-            printer = st.session_state.get('selected_printer_local')
-            if printer:
-                success, msg = print_local_windows(tmp_path, printer)
-                time.sleep(1) # Wait for spool
-                try: os.remove(tmp_path) 
-                except: pass
-                if success: return True
-                else: st.error(msg); return False
-            else: st.warning("Select local printer!"); return False
-        else:
-            return False
+        st.session_state['web_print_trigger'] = bytes_data
+        return True
 
     def process_scan():
         scan_val = st.session_state.scan_input.strip(); 
@@ -466,12 +457,8 @@ elif st.session_state['page'] == 'scan_print':
         if st.button("🔙 Back", use_container_width=True): nav('view_saved')
     
     with c_pr:
-        if print_mode == "Local (Direct USB)":
-            printers = get_windows_printers()
-            if 'selected_printer_local' not in st.session_state: st.session_state['selected_printer_local'] = printers[0] if printers else None
-            st.selectbox("Select Printer", printers, key='selected_printer_local', label_visibility="collapsed")
-        else:
-            st.caption("🌐 Using Chrome Kiosk Mode")
+        if print_mode == "Web (Browser Kiosk)": st.caption("🌐 Kiosk Mode (Silent)")
+        else: st.caption("🌐 Normal Mode (Popup)")
 
     st.divider(); st.text_input("SCAN BARCODE", key='scan_input', on_change=process_scan)
 
@@ -496,13 +483,22 @@ elif st.session_state['page'] == 'scan_print':
 # 6. VIEW SAVED
 elif st.session_state['page'] == 'view_saved':
     home_button(); pkg = st.session_state['curr_con']; c_id = pkg['id']; st.title(f"Consignment: {c_id}")
+    
+    # SAFE DOWNLOAD BUTTONS (Wrapped in Try-Except to prevent crash)
     r1, r2, r3 = st.columns(3)
     with r1: csv_b=io.BytesIO(); pkg['original_data'].to_csv(csv_b, index=False); st.download_button("⬇ CSV", csv_b.getvalue(), f"{c_id}.csv")
     with r2: st.download_button("⬇ Data PDF", generate_consignment_data_pdf(pkg['data'], pkg), f"Data_{c_id}.pdf")
     with r3: st.download_button("⬇ Confirm CSV", generate_confirm_consignment_csv(pkg['data']), f"Confirm_{c_id}.csv")
+    
     r4, r5 = st.columns(2)
-    with r4: st.download_button("⬇ Bartender", generate_bartender_full(pkg['data']), f"Bartender_{c_id}.xlsx")
+    with r4: 
+        try:
+            bt_data = generate_bartender_full(pkg['data'])
+            if bt_data: st.download_button("⬇ Bartender", bt_data, f"Bartender_{c_id}.xlsx")
+            else: st.warning("Bartender data unavailable")
+        except Exception as e: st.error(f"Error: {e}")
     with r5: st.download_button("⬇ Ewaybill", generate_excel_simple(pkg['data'], ['SKU Id', 'Editable Qty', 'Cost Price'], f"Eway_{c_id}.xlsx"), f"Eway_{c_id}.xlsx")
+    
     st.divider(); st.subheader("Labels & Printing")
     uc1, uc2 = st.columns([1, 1])
     with uc1:
