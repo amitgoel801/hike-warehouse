@@ -19,14 +19,11 @@ from pypdf import PdfReader, PdfWriter, Transformation, PageObject
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Hike Warehouse Manager", layout="wide")
 
-# --- DATABASE CONNECTION (GOOGLE SHEETS) ---
+# --- DATABASE CONNECTION ---
 def get_db_connection():
     try:
-        # Check if secrets exist before crashing
         if "gcp_service_account" not in st.secrets:
-            st.error("Secrets not found! Please add 'gcp_service_account' to App Settings.")
-            st.stop()
-            
+            st.error("Secrets not configured!"); st.stop()
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
         creds_dict = dict(st.secrets["gcp_service_account"])
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
@@ -34,14 +31,12 @@ def get_db_connection():
         sheet_url = st.secrets["database"]["sheet_url"]
         return client.open_by_url(sheet_url)
     except Exception as e:
-        st.error(f"Database Connection Error: {e}")
-        st.stop()
+        st.error(f"Database Error: {e}"); st.stop()
 
 # --- AUTHENTICATION ---
 def load_users():
     try:
-        sh = get_db_connection()
-        ws = sh.worksheet("Users")
+        sh = get_db_connection(); ws = sh.worksheet("Users")
         data = ws.get_all_records()
         if not data: return {"admin": "admin123"} 
         return {str(row['username']): str(row['password']) for row in data}
@@ -49,9 +44,7 @@ def load_users():
 
 def save_users(users_dict):
     try:
-        sh = get_db_connection()
-        ws = sh.worksheet("Users")
-        ws.clear()
+        sh = get_db_connection(); ws = sh.worksheet("Users"); ws.clear()
         rows = [["username", "password"]] + [[u, p] for u, p in users_dict.items()]
         ws.update(rows)
     except Exception as e: st.error(f"DB Error: {e}")
@@ -66,61 +59,40 @@ if not st.session_state['logged_in']:
         users = load_users()
         if u in users and users[u] == p:
             st.session_state['logged_in'] = True; st.session_state['username'] = u; st.rerun()
-        else: st.error("Invalid Username or Password")
+        else: st.error("Invalid Credentials")
     st.stop()
 
-# --- SIDEBAR & SETTINGS ---
+# --- SIDEBAR ---
 with st.sidebar:
     st.write(f"👤 **{st.session_state['username']}**")
     if st.button("Logout"): st.session_state['logged_in'] = False; st.rerun()
     
-    if st.session_state['username'] == 'admin':
-        with st.expander("Admin: Add User"):
-            new_u = st.text_input("New User"); new_p = st.text_input("New Pass")
-            if st.button("Save User"): 
-                users = load_users(); users[new_u] = new_p; save_users(users)
-                st.success("Saved!"); time.sleep(1); st.rerun()
-
     st.divider()
     st.header("🖨️ Printing Mode")
+    print_mode = st.radio("Select Method:", ["Web (Kiosk/Popup)", "Local (Windows App)"], index=0)
     
-    print_mode = st.radio("Select Method:", 
-                          ["Web (Browser Kiosk)", "Normal Print (Popup)", "Local (Direct USB)"], 
-                          index=0)
-    
-    if print_mode == "Web (Browser Kiosk)":
-        st.info("Silent printing via Chrome Kiosk Shortcut.")
-    elif print_mode == "Normal Print (Popup)":
-        st.info("Standard browser print dialog.")
+    if print_mode == "Web (Kiosk/Popup)":
+        st.info("Uses browser settings. For silent print, use Kiosk Shortcut.")
     else:
-        if HAS_WIN32: st.success("Windows Spooler Ready")
-        else: st.warning("Requires Windows Server")
+        st.warning("Requires 'app.py' running locally on Windows.")
 
 # --- FILE PATHS ---
 FILES_DIR = "consignment_files"
 CACHE_FILE = "master_data.csv" 
-SHEET_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRdLEddTZgmuUSswPp3A_HM7DGH8UCUWEmqd-cIbbJ7nb_Eq4YvZxO0vjWESlxX-9Y6VWRcVLPFlIVp/pub?gid=0&single=true&output=csv"
-
 if not os.path.exists(FILES_DIR): os.makedirs(FILES_DIR)
 
-# --- PERMANENT DATA MANAGERS (CHUNKED STORAGE) ---
+# --- PERMANENT DATA (GOOGLE SHEETS) ---
 def load_history():
     try:
-        sh = get_db_connection()
-        ws = sh.worksheet("History")
+        sh = get_db_connection(); ws = sh.worksheet("History")
         all_rows = ws.get_all_values()
-        
         if not all_rows or len(all_rows) < 2: return []
-        
         history = []
-        # Skip Header (Row 0)
         for row in all_rows[1:]:
-            # Join chunks from col 3 onwards (Cols D, E, F...)
             json_str = "".join([cell for cell in row[3:] if cell])
             if not json_str: continue
             try:
                 con_obj = json.loads(json_str)
-                # Rebuild DataFrames
                 if 'data' in con_obj: con_obj['data'] = pd.DataFrame(con_obj['data'])
                 if 'original_data' in con_obj: con_obj['original_data'] = pd.DataFrame(con_obj['original_data'])
                 history.append(con_obj)
@@ -130,32 +102,18 @@ def load_history():
 
 def save_history(history_list):
     try:
-        sh = get_db_connection()
-        ws = sh.worksheet("History")
-        ws.clear()
-        
-        # Prepare Rows [ID, Date, Channel, Chunk1, Chunk2...]
+        sh = get_db_connection(); ws = sh.worksheet("History"); ws.clear()
         rows = [["id", "date", "channel", "data_chunks"]]
-        
         for h in history_list:
             h_copy = h.copy()
-            # Serialize DFs
-            if 'data' in h_copy and isinstance(h_copy['data'], pd.DataFrame): 
-                h_copy['data'] = h_copy['data'].to_dict('records')
-            if 'original_data' in h_copy and isinstance(h_copy['original_data'], pd.DataFrame): 
-                h_copy['original_data'] = h_copy['original_data'].to_dict('records')
-            
+            if 'data' in h_copy and isinstance(h_copy['data'], pd.DataFrame): h_copy['data'] = h_copy['data'].to_dict('records')
+            if 'original_data' in h_copy and isinstance(h_copy['original_data'], pd.DataFrame): h_copy['original_data'] = h_copy['original_data'].to_dict('records')
             full_json = json.dumps(h_copy)
-            
-            # Chunk split (40k chars to be safe under 50k limit)
             chunk_size = 40000
             chunks = [full_json[i:i+chunk_size] for i in range(0, len(full_json), chunk_size)]
-            
             rows.append([h['id'], h['date'], h['channel']] + chunks)
-            
         ws.update(rows)
-    except Exception as e:
-        st.error(f"Save Error (History): {e}")
+    except Exception as e: st.error(f"Save Error: {e}")
 
 def load_address_data(sheet_name, default_cols):
     try:
@@ -173,7 +131,9 @@ def save_address_data(sheet_name, df):
 
 def sync_data():
     try:
-        df = pd.read_csv(SHEET_URL, dtype={'EAN': str})
+        sheet_url = st.secrets["database"]["sheet_url"]
+        csv_url = sheet_url.replace('/edit?gid=', '/export?format=csv&gid=').split('#')[0]
+        df = pd.read_csv(csv_url, dtype={'EAN': str})
         if 'PPCN' not in df.columns: return False, "Column 'PPCN' missing."
         df.to_csv(CACHE_FILE, index=False)
         return True, "✅ Master Data Synced!"
@@ -202,26 +162,44 @@ def extract_box_pdf_page(merged_pdf_path, box_index):
         return output_bytes.getvalue(), writer
     except: return None, None
 
-# BROWSER PRINT TRIGGER
+# --- NEW AGGRESSIVE PRINT TRIGGER ---
 def trigger_browser_print(pdf_bytes):
     """
-    Embeds the PDF and calls window.print(). 
+    Forces the browser to load the PDF in a hidden iframe and print it.
+    Works for both Normal (Popup) and Kiosk (Silent) modes.
     """
     base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
-    pdf_display = f"""
-        <iframe src="data:application/pdf;base64,{base64_pdf}" 
-                id="pdf_frame" 
-                style="position:absolute; top:-10000px; left:-10000px; width:1px; height:1px;">
+    
+    # 1. We create an embedded Iframe
+    # 2. We use 'onload' to wait for PDF rendering
+    # 3. We use a backup timeout just in case onload fails
+    html_code = f"""
+        <iframe id="pdf_print_frame" 
+                src="data:application/pdf;base64,{base64_pdf}"
+                style="position: fixed; width: 1px; height: 1px; bottom: 0; right: 0; border: none;">
         </iframe>
         <script>
-            setTimeout(function() {{
-                var frame = document.getElementById('pdf_frame');
-                frame.contentWindow.focus();
-                frame.contentWindow.print();
-            }}, 800); 
+            var iframe = document.getElementById('pdf_print_frame');
+            
+            function doPrint() {{
+                try {{
+                    iframe.contentWindow.focus();
+                    iframe.contentWindow.print();
+                }} catch(e) {{
+                    console.error("Print failed: " + e);
+                }}
+            }}
+
+            // Attempt 1: On Load
+            iframe.onload = function() {{
+                setTimeout(doPrint, 500); 
+            }};
+            
+            // Attempt 2: Backup Timer (in case onload misses)
+            setTimeout(doPrint, 1500);
         </script>
     """
-    components.html(pdf_display, height=0, width=0)
+    components.html(html_code, height=0, width=0)
 
 # Local Fallback
 def print_local_windows(pdf_path, printer_name):
@@ -238,7 +216,7 @@ def get_windows_printers():
         return [p[2] for p in printers]
     except: return ["Default"]
 
-# --- GENERATORS (PDFs) ---
+# --- GENERATORS ---
 def generate_confirm_consignment_csv(df):
     output = io.BytesIO(); sorted_df = df.sort_values(by='SKU Id'); rows = []; box_counter = 1
     for _, row in sorted_df.iterrows():
@@ -476,10 +454,7 @@ elif st.session_state['page'] == 'scan_print':
                     if 'printed_boxes' not in pkg: pkg['printed_boxes'] = []
                     pkg['printed_boxes'].append(int(target_box))
                     save_history(st.session_state['consignments'])
-                    if print_mode == "Normal Print (Popup)":
-                        st.toast(f"🖨️ Opening Popup for Box {target_box}...", icon="✅")
-                    else:
-                        st.toast(f"🖨️ Printing Box {target_box}...", icon="✅")
+                    st.toast(f"🖨️ Printing Box {target_box}...", icon="✅")
         st.session_state.scan_input = ""
 
     def trigger_reprint_manual(box_num):
@@ -497,10 +472,8 @@ elif st.session_state['page'] == 'scan_print':
             except: printers = ["Default"]
             if 'selected_printer_local' not in st.session_state: st.session_state['selected_printer_local'] = printers[0] if printers else None
             st.selectbox("Select Printer", printers, key='selected_printer_local', label_visibility="collapsed")
-        elif print_mode == "Web (Browser Kiosk)":
-            st.caption("🌐 Using Chrome Kiosk (Silent)")
-        else:
-            st.caption("🌐 Using Normal Popup")
+        elif print_mode == "Web (Kiosk/Popup)":
+            st.caption("🌐 Using Browser Print Trigger")
 
     st.divider(); st.text_input("SCAN BARCODE", key='scan_input', on_change=process_scan)
 
@@ -537,7 +510,7 @@ elif st.session_state['page'] == 'view_saved':
         try:
             bt_data = generate_bartender_full(pkg['data'])
             if bt_data: st.download_button("⬇ Bartender", bt_data, f"Bartender_{c_id}.xlsx")
-            else: st.warning("Bartender data unavailable")
+            else: st.warning("Bartender: Data error or missing SKU Id")
         except Exception as e: st.error(f"Error: {e}")
     with r5: st.download_button("⬇ Ewaybill", generate_excel_simple(pkg['data'], ['SKU Id', 'Editable Qty', 'Cost Price'], f"Eway_{c_id}.xlsx"), f"Eway_{c_id}.xlsx")
     
