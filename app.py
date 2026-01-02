@@ -6,11 +6,9 @@ import json
 import time
 import base64
 import tempfile
-import datetime
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import streamlit.components.v1 as components
-import extra_streamlit_components as stx  # NEW LIBRARY FOR COOKIES
 from reportlab.lib.pagesizes import A4, mm
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
@@ -21,9 +19,14 @@ from pypdf import PdfReader, PdfWriter, Transformation, PageObject
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Hike Warehouse Manager", layout="wide")
 
-# --- DATABASE CONNECTION ---
+# --- DATABASE CONNECTION (GOOGLE SHEETS) ---
 def get_db_connection():
     try:
+        # Check if secrets exist before crashing
+        if "gcp_service_account" not in st.secrets:
+            st.error("Secrets not found! Please add 'gcp_service_account' to App Settings.")
+            st.stop()
+            
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
         creds_dict = dict(st.secrets["gcp_service_account"])
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
@@ -31,66 +34,56 @@ def get_db_connection():
         sheet_url = st.secrets["database"]["sheet_url"]
         return client.open_by_url(sheet_url)
     except Exception as e:
-        st.error(f"Database Error: {e}")
+        st.error(f"Database Connection Error: {e}")
         st.stop()
 
-# --- AUTHENTICATION WITH COOKIES ---
-def get_manager():
-    return stx.CookieManager()
-
+# --- AUTHENTICATION ---
 def load_users():
     try:
         sh = get_db_connection()
         ws = sh.worksheet("Users")
         data = ws.get_all_records()
-        if not data: return {"admin": "admin123"}
+        if not data: return {"admin": "admin123"} 
         return {str(row['username']): str(row['password']) for row in data}
     except: return {"admin": "admin123"}
 
-cookie_manager = get_manager()
-users = load_users()
+def save_users(users_dict):
+    try:
+        sh = get_db_connection()
+        ws = sh.worksheet("Users")
+        ws.clear()
+        rows = [["username", "password"]] + [[u, p] for u, p in users_dict.items()]
+        ws.update(rows)
+    except Exception as e: st.error(f"DB Error: {e}")
 
-# Check Cookie First
-cookie_user = cookie_manager.get(cookie="hike_user")
+if 'logged_in' not in st.session_state: st.session_state['logged_in'] = False
 
-if 'logged_in' not in st.session_state:
-    if cookie_user:
-        st.session_state['logged_in'] = True
-        st.session_state['username'] = cookie_user
-    else:
-        st.session_state['logged_in'] = False
-
-# Login Screen
 if not st.session_state['logged_in']:
     st.title("🔒 Login")
-    c1, c2 = st.columns([1, 2])
-    with c1:
-        u = st.text_input("Username")
-        p = st.text_input("Password", type="password")
-        remember = st.checkbox("Keep me logged in for today")
-        
-        if st.button("Login", type="primary"):
-            if u in users and users[u] == p:
-                st.session_state['logged_in'] = True
-                st.session_state['username'] = u
-                if remember:
-                    # Save cookie for 1 day
-                    cookie_manager.set("hike_user", u, expires_at=datetime.datetime.now() + datetime.timedelta(days=1))
-                st.rerun()
-            else:
-                st.error("Invalid Credentials")
+    u = st.text_input("Username")
+    p = st.text_input("Password", type="password")
+    if st.button("Login", type="primary"):
+        users = load_users()
+        if u in users and users[u] == p:
+            st.session_state['logged_in'] = True; st.session_state['username'] = u; st.rerun()
+        else: st.error("Invalid Username or Password")
     st.stop()
 
-# --- SIDEBAR ---
+# --- SIDEBAR & SETTINGS ---
 with st.sidebar:
     st.write(f"👤 **{st.session_state['username']}**")
-    if st.button("Logout"):
-        st.session_state['logged_in'] = False
-        cookie_manager.delete("hike_user") # Delete cookie
-        st.rerun()
-        
+    if st.button("Logout"): st.session_state['logged_in'] = False; st.rerun()
+    
+    if st.session_state['username'] == 'admin':
+        with st.expander("Admin: Add User"):
+            new_u = st.text_input("New User"); new_p = st.text_input("New Pass")
+            if st.button("Save User"): 
+                users = load_users(); users[new_u] = new_p; save_users(users)
+                st.success("Saved!"); time.sleep(1); st.rerun()
+
     st.divider()
     st.header("🖨️ Printing Mode")
+    
     print_mode = st.radio("Select Method:", 
                           ["Web (Browser Kiosk)", "Normal Print (Popup)", "Local (Direct USB)"], 
                           index=0)
@@ -98,28 +91,36 @@ with st.sidebar:
     if print_mode == "Web (Browser Kiosk)":
         st.info("Silent printing via Chrome Kiosk Shortcut.")
     elif print_mode == "Normal Print (Popup)":
-        st.info("Opens standard browser print dialog.")
+        st.info("Standard browser print dialog.")
     else:
-        st.info("Requires Windows Server.")
+        if HAS_WIN32: st.success("Windows Spooler Ready")
+        else: st.warning("Requires Windows Server")
 
 # --- FILE PATHS ---
 FILES_DIR = "consignment_files"
 CACHE_FILE = "master_data.csv" 
+SHEET_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRdLEddTZgmuUSswPp3A_HM7DGH8UCUWEmqd-cIbbJ7nb_Eq4YvZxO0vjWESlxX-9Y6VWRcVLPFlIVp/pub?gid=0&single=true&output=csv"
+
 if not os.path.exists(FILES_DIR): os.makedirs(FILES_DIR)
 
-# --- PERMANENT DATA MANAGERS (CHUNKED) ---
+# --- PERMANENT DATA MANAGERS (CHUNKED STORAGE) ---
 def load_history():
     try:
         sh = get_db_connection()
         ws = sh.worksheet("History")
         all_rows = ws.get_all_values()
+        
         if not all_rows or len(all_rows) < 2: return []
+        
         history = []
+        # Skip Header (Row 0)
         for row in all_rows[1:]:
+            # Join chunks from col 3 onwards (Cols D, E, F...)
             json_str = "".join([cell for cell in row[3:] if cell])
             if not json_str: continue
             try:
                 con_obj = json.loads(json_str)
+                # Rebuild DataFrames
                 if 'data' in con_obj: con_obj['data'] = pd.DataFrame(con_obj['data'])
                 if 'original_data' in con_obj: con_obj['original_data'] = pd.DataFrame(con_obj['original_data'])
                 history.append(con_obj)
@@ -129,18 +130,32 @@ def load_history():
 
 def save_history(history_list):
     try:
-        sh = get_db_connection(); ws = sh.worksheet("History"); ws.clear()
+        sh = get_db_connection()
+        ws = sh.worksheet("History")
+        ws.clear()
+        
+        # Prepare Rows [ID, Date, Channel, Chunk1, Chunk2...]
         rows = [["id", "date", "channel", "data_chunks"]]
+        
         for h in history_list:
             h_copy = h.copy()
-            if 'data' in h_copy and isinstance(h_copy['data'], pd.DataFrame): h_copy['data'] = h_copy['data'].to_dict('records')
-            if 'original_data' in h_copy and isinstance(h_copy['original_data'], pd.DataFrame): h_copy['original_data'] = h_copy['original_data'].to_dict('records')
+            # Serialize DFs
+            if 'data' in h_copy and isinstance(h_copy['data'], pd.DataFrame): 
+                h_copy['data'] = h_copy['data'].to_dict('records')
+            if 'original_data' in h_copy and isinstance(h_copy['original_data'], pd.DataFrame): 
+                h_copy['original_data'] = h_copy['original_data'].to_dict('records')
+            
             full_json = json.dumps(h_copy)
+            
+            # Chunk split (40k chars to be safe under 50k limit)
             chunk_size = 40000
             chunks = [full_json[i:i+chunk_size] for i in range(0, len(full_json), chunk_size)]
+            
             rows.append([h['id'], h['date'], h['channel']] + chunks)
+            
         ws.update(rows)
-    except Exception as e: st.error(f"Save Error: {e}")
+    except Exception as e:
+        st.error(f"Save Error (History): {e}")
 
 def load_address_data(sheet_name, default_cols):
     try:
@@ -158,8 +173,7 @@ def save_address_data(sheet_name, df):
 
 def sync_data():
     try:
-        sheet_url = st.secrets["database"]["sheet_url"]
-        df = pd.read_csv(sheet_url.replace('/edit?gid=', '/export?format=csv&gid=').split('#')[0], dtype={'EAN': str})
+        df = pd.read_csv(SHEET_URL, dtype={'EAN': str})
         if 'PPCN' not in df.columns: return False, "Column 'PPCN' missing."
         df.to_csv(CACHE_FILE, index=False)
         return True, "✅ Master Data Synced!"
@@ -188,45 +202,26 @@ def extract_box_pdf_page(merged_pdf_path, box_index):
         return output_bytes.getvalue(), writer
     except: return None, None
 
-# --- NEW ROBUST JS PRINT TRIGGER (BLOB METHOD) ---
+# BROWSER PRINT TRIGGER
 def trigger_browser_print(pdf_bytes):
     """
-    Uses Blob + ObjectURL + Iframe to print.
-    This bypasses many security restrictions that block Data URIs.
+    Embeds the PDF and calls window.print(). 
     """
     base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
-    
-    js_code = f"""
-    <script>
-        (function() {{
-            var binary = atob("{base64_pdf}");
-            var len = binary.length;
-            var buffer = new ArrayBuffer(len);
-            var view = new Uint8Array(buffer);
-            for (var i = 0; i < len; i++) {{
-                view[i] = binary.charCodeAt(i);
-            }}
-            var blob = new Blob([view], {{type: "application/pdf"}});
-            var url = URL.createObjectURL(blob);
-            
-            var iframe = document.createElement('iframe');
-            iframe.style.position = 'fixed';
-            iframe.style.width = '0px';
-            iframe.style.height = '0px';
-            iframe.style.border = 'none';
-            iframe.src = url;
-            document.body.appendChild(iframe);
-            
-            iframe.onload = function() {{
-                setTimeout(function() {{
-                    iframe.contentWindow.focus();
-                    iframe.contentWindow.print();
-                }}, 1000); // 1 sec delay to ensure render
-            }};
-        }})();
-    </script>
+    pdf_display = f"""
+        <iframe src="data:application/pdf;base64,{base64_pdf}" 
+                id="pdf_frame" 
+                style="position:absolute; top:-10000px; left:-10000px; width:1px; height:1px;">
+        </iframe>
+        <script>
+            setTimeout(function() {{
+                var frame = document.getElementById('pdf_frame');
+                frame.contentWindow.focus();
+                frame.contentWindow.print();
+            }}, 800); 
+        </script>
     """
-    components.html(js_code, height=0, width=0)
+    components.html(pdf_display, height=0, width=0)
 
 # Local Fallback
 def print_local_windows(pdf_path, printer_name):
@@ -447,7 +442,7 @@ elif st.session_state['page'] == 'scan_print':
         if not bytes_data: st.error("PDF Error"); return False
         
         if print_mode == "Local (Direct USB)":
-            if not os.name == 'nt': st.error("Local Mode requires Windows + pywin32"); return False
+            if not HAS_WIN32: st.error("Local Mode requires Windows + pywin32"); return False
             try:
                 import win32api
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -481,7 +476,10 @@ elif st.session_state['page'] == 'scan_print':
                     if 'printed_boxes' not in pkg: pkg['printed_boxes'] = []
                     pkg['printed_boxes'].append(int(target_box))
                     save_history(st.session_state['consignments'])
-                    st.toast(f"🖨️ Printing Box {target_box}...", icon="✅")
+                    if print_mode == "Normal Print (Popup)":
+                        st.toast(f"🖨️ Opening Popup for Box {target_box}...", icon="✅")
+                    else:
+                        st.toast(f"🖨️ Printing Box {target_box}...", icon="✅")
         st.session_state.scan_input = ""
 
     def trigger_reprint_manual(box_num):
@@ -528,6 +526,7 @@ elif st.session_state['page'] == 'scan_print':
 elif st.session_state['page'] == 'view_saved':
     home_button(); pkg = st.session_state['curr_con']; c_id = pkg['id']; st.title(f"Consignment: {c_id}")
     
+    # SAFE DOWNLOAD BUTTONS (Wrapped in Try-Except to prevent crash)
     r1, r2, r3 = st.columns(3)
     with r1: csv_b=io.BytesIO(); pkg['original_data'].to_csv(csv_b, index=False); st.download_button("⬇ CSV", csv_b.getvalue(), f"{c_id}.csv")
     with r2: st.download_button("⬇ Data PDF", generate_consignment_data_pdf(pkg['data'], pkg), f"Data_{c_id}.pdf")
@@ -538,7 +537,7 @@ elif st.session_state['page'] == 'view_saved':
         try:
             bt_data = generate_bartender_full(pkg['data'])
             if bt_data: st.download_button("⬇ Bartender", bt_data, f"Bartender_{c_id}.xlsx")
-            else: st.warning("Bartender: Data error or missing SKU Id")
+            else: st.warning("Bartender data unavailable")
         except Exception as e: st.error(f"Error: {e}")
     with r5: st.download_button("⬇ Ewaybill", generate_excel_simple(pkg['data'], ['SKU Id', 'Editable Qty', 'Cost Price'], f"Eway_{c_id}.xlsx"), f"Eway_{c_id}.xlsx")
     
