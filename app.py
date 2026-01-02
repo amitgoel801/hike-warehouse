@@ -6,9 +6,11 @@ import json
 import time
 import base64
 import tempfile
+import datetime
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import streamlit.components.v1 as components
+import extra_streamlit_components as stx  # NEW LIBRARY FOR COOKIES
 from reportlab.lib.pagesizes import A4, mm
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
@@ -19,7 +21,7 @@ from pypdf import PdfReader, PdfWriter, Transformation, PageObject
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Hike Warehouse Manager", layout="wide")
 
-# --- DATABASE CONNECTION (GOOGLE SHEETS) ---
+# --- DATABASE CONNECTION ---
 def get_db_connection():
     try:
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
@@ -29,93 +31,95 @@ def get_db_connection():
         sheet_url = st.secrets["database"]["sheet_url"]
         return client.open_by_url(sheet_url)
     except Exception as e:
-        st.error(f"Database Connection Error: {e}")
+        st.error(f"Database Error: {e}")
         st.stop()
 
-# --- AUTHENTICATION ---
+# --- AUTHENTICATION WITH COOKIES ---
+def get_manager():
+    return stx.CookieManager()
+
 def load_users():
     try:
         sh = get_db_connection()
         ws = sh.worksheet("Users")
         data = ws.get_all_records()
-        if not data: return {"admin": "admin123"} 
+        if not data: return {"admin": "admin123"}
         return {str(row['username']): str(row['password']) for row in data}
     except: return {"admin": "admin123"}
 
-def save_users(users_dict):
-    try:
-        sh = get_db_connection()
-        ws = sh.worksheet("Users")
-        ws.clear()
-        rows = [["username", "password"]] + [[u, p] for u, p in users_dict.items()]
-        ws.update(rows)
-    except Exception as e: st.error(f"DB Error: {e}")
+cookie_manager = get_manager()
+users = load_users()
 
-if 'logged_in' not in st.session_state: st.session_state['logged_in'] = False
+# Check Cookie First
+cookie_user = cookie_manager.get(cookie="hike_user")
 
+if 'logged_in' not in st.session_state:
+    if cookie_user:
+        st.session_state['logged_in'] = True
+        st.session_state['username'] = cookie_user
+    else:
+        st.session_state['logged_in'] = False
+
+# Login Screen
 if not st.session_state['logged_in']:
     st.title("🔒 Login")
-    u = st.text_input("Username")
-    p = st.text_input("Password", type="password")
-    if st.button("Login", type="primary"):
-        users = load_users()
-        if u in users and users[u] == p:
-            st.session_state['logged_in'] = True; st.session_state['username'] = u; st.rerun()
-        else: st.error("Invalid Username or Password")
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        u = st.text_input("Username")
+        p = st.text_input("Password", type="password")
+        remember = st.checkbox("Keep me logged in for today")
+        
+        if st.button("Login", type="primary"):
+            if u in users and users[u] == p:
+                st.session_state['logged_in'] = True
+                st.session_state['username'] = u
+                if remember:
+                    # Save cookie for 1 day
+                    cookie_manager.set("hike_user", u, expires_at=datetime.datetime.now() + datetime.timedelta(days=1))
+                st.rerun()
+            else:
+                st.error("Invalid Credentials")
     st.stop()
 
-# --- SIDEBAR & SETTINGS ---
+# --- SIDEBAR ---
 with st.sidebar:
     st.write(f"👤 **{st.session_state['username']}**")
-    if st.button("Logout"): st.session_state['logged_in'] = False; st.rerun()
-    
-    if st.session_state['username'] == 'admin':
-        with st.expander("Admin: Add User"):
-            new_u = st.text_input("New User"); new_p = st.text_input("New Pass")
-            if st.button("Save User"): 
-                users = load_users(); users[new_u] = new_p; save_users(users)
-                st.success("Saved!"); time.sleep(1); st.rerun()
-
+    if st.button("Logout"):
+        st.session_state['logged_in'] = False
+        cookie_manager.delete("hike_user") # Delete cookie
+        st.rerun()
+        
     st.divider()
     st.header("🖨️ Printing Mode")
-    
-    # 3 Options
     print_mode = st.radio("Select Method:", 
                           ["Web (Browser Kiosk)", "Normal Print (Popup)", "Local (Direct USB)"], 
                           index=0)
     
     if print_mode == "Web (Browser Kiosk)":
-        st.info("Silent printing via Chrome Kiosk Mode.")
+        st.info("Silent printing via Chrome Kiosk Shortcut.")
     elif print_mode == "Normal Print (Popup)":
-        st.info("Opens standard print dialog (Ctrl+P).")
+        st.info("Opens standard browser print dialog.")
     else:
         st.info("Requires Windows Server.")
 
 # --- FILE PATHS ---
 FILES_DIR = "consignment_files"
 CACHE_FILE = "master_data.csv" 
-SHEET_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRdLEddTZgmuUSswPp3A_HM7DGH8UCUWEmqd-cIbbJ7nb_Eq4YvZxO0vjWESlxX-9Y6VWRcVLPFlIVp/pub?gid=0&single=true&output=csv"
-
 if not os.path.exists(FILES_DIR): os.makedirs(FILES_DIR)
 
-# --- PERMANENT DATA MANAGERS ---
+# --- PERMANENT DATA MANAGERS (CHUNKED) ---
 def load_history():
     try:
         sh = get_db_connection()
         ws = sh.worksheet("History")
         all_rows = ws.get_all_values()
-        
         if not all_rows or len(all_rows) < 2: return []
-        
         history = []
-        # Skip Header (Row 0)
         for row in all_rows[1:]:
-            # Join chunks from col 3 onwards
             json_str = "".join([cell for cell in row[3:] if cell])
             if not json_str: continue
             try:
                 con_obj = json.loads(json_str)
-                # Rebuild DataFrames
                 if 'data' in con_obj: con_obj['data'] = pd.DataFrame(con_obj['data'])
                 if 'original_data' in con_obj: con_obj['original_data'] = pd.DataFrame(con_obj['original_data'])
                 history.append(con_obj)
@@ -125,29 +129,18 @@ def load_history():
 
 def save_history(history_list):
     try:
-        sh = get_db_connection()
-        ws = sh.worksheet("History")
-        ws.clear()
-        
-        # Prepare Rows
+        sh = get_db_connection(); ws = sh.worksheet("History"); ws.clear()
         rows = [["id", "date", "channel", "data_chunks"]]
-        
         for h in history_list:
             h_copy = h.copy()
-            if 'data' in h_copy and isinstance(h_copy['data'], pd.DataFrame): 
-                h_copy['data'] = h_copy['data'].to_dict('records')
-            if 'original_data' in h_copy and isinstance(h_copy['original_data'], pd.DataFrame): 
-                h_copy['original_data'] = h_copy['original_data'].to_dict('records')
-            
+            if 'data' in h_copy and isinstance(h_copy['data'], pd.DataFrame): h_copy['data'] = h_copy['data'].to_dict('records')
+            if 'original_data' in h_copy and isinstance(h_copy['original_data'], pd.DataFrame): h_copy['original_data'] = h_copy['original_data'].to_dict('records')
             full_json = json.dumps(h_copy)
             chunk_size = 40000
             chunks = [full_json[i:i+chunk_size] for i in range(0, len(full_json), chunk_size)]
-            
             rows.append([h['id'], h['date'], h['channel']] + chunks)
-            
         ws.update(rows)
-    except Exception as e:
-        st.error(f"Save Error (History): {e}")
+    except Exception as e: st.error(f"Save Error: {e}")
 
 def load_address_data(sheet_name, default_cols):
     try:
@@ -165,7 +158,8 @@ def save_address_data(sheet_name, df):
 
 def sync_data():
     try:
-        df = pd.read_csv(SHEET_URL, dtype={'EAN': str})
+        sheet_url = st.secrets["database"]["sheet_url"]
+        df = pd.read_csv(sheet_url.replace('/edit?gid=', '/export?format=csv&gid=').split('#')[0], dtype={'EAN': str})
         if 'PPCN' not in df.columns: return False, "Column 'PPCN' missing."
         df.to_csv(CACHE_FILE, index=False)
         return True, "✅ Master Data Synced!"
@@ -194,35 +188,45 @@ def extract_box_pdf_page(merged_pdf_path, box_index):
         return output_bytes.getvalue(), writer
     except: return None, None
 
-# --- NEW ROBUST BROWSER PRINT TRIGGER ---
+# --- NEW ROBUST JS PRINT TRIGGER (BLOB METHOD) ---
 def trigger_browser_print(pdf_bytes):
     """
-    Standard print trigger for both Kiosk and Normal modes.
-    Uses 'iframe.onload' to ensure PDF is ready before printing.
+    Uses Blob + ObjectURL + Iframe to print.
+    This bypasses many security restrictions that block Data URIs.
     """
     base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
     
-    # We use a dedicated HTML block that forces the iframe to load then print
-    pdf_display = f"""
-        <html>
-        <body>
-            <iframe id="pdf_frame" 
-                    src="data:application/pdf;base64,{base64_pdf}" 
-                    style="position:absolute; top:-10000px; left:-10000px; width:1px; height:1px;">
-            </iframe>
-            <script>
-                var frame = document.getElementById('pdf_frame');
-                frame.onload = function() {{
-                    setTimeout(function() {{
-                        frame.contentWindow.focus();
-                        frame.contentWindow.print();
-                    }}, 500); // Small buffer after load
-                }};
-            </script>
-        </body>
-        </html>
+    js_code = f"""
+    <script>
+        (function() {{
+            var binary = atob("{base64_pdf}");
+            var len = binary.length;
+            var buffer = new ArrayBuffer(len);
+            var view = new Uint8Array(buffer);
+            for (var i = 0; i < len; i++) {{
+                view[i] = binary.charCodeAt(i);
+            }}
+            var blob = new Blob([view], {{type: "application/pdf"}});
+            var url = URL.createObjectURL(blob);
+            
+            var iframe = document.createElement('iframe');
+            iframe.style.position = 'fixed';
+            iframe.style.width = '0px';
+            iframe.style.height = '0px';
+            iframe.style.border = 'none';
+            iframe.src = url;
+            document.body.appendChild(iframe);
+            
+            iframe.onload = function() {{
+                setTimeout(function() {{
+                    iframe.contentWindow.focus();
+                    iframe.contentWindow.print();
+                }}, 1000); // 1 sec delay to ensure render
+            }};
+        }})();
+    </script>
     """
-    components.html(pdf_display, height=0, width=0)
+    components.html(js_code, height=0, width=0)
 
 # Local Fallback
 def print_local_windows(pdf_path, printer_name):
@@ -443,19 +447,21 @@ elif st.session_state['page'] == 'scan_print':
         if not bytes_data: st.error("PDF Error"); return False
         
         if print_mode == "Local (Direct USB)":
-            if not HAS_WIN32: st.error("Local requires Windows App"); return False
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                writer.write(tmp); tmp_path = tmp.name
-            printer = st.session_state.get('selected_printer_local')
-            if printer:
-                success, msg = print_local_windows(tmp_path, printer)
-                try: os.remove(tmp_path) 
-                except: pass
-                if success: return True
-                else: st.error(msg); return False
-            else: st.warning("Select local printer!"); return False
+            if not os.name == 'nt': st.error("Local Mode requires Windows + pywin32"); return False
+            try:
+                import win32api
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                    writer.write(tmp); tmp_path = tmp.name
+                printer = st.session_state.get('selected_printer_local')
+                if printer:
+                    win32api.ShellExecute(0, "printto", tmp_path, f'"{printer}"', ".", 0)
+                    time.sleep(1); 
+                    try: os.remove(tmp_path) 
+                    except: pass
+                    return True
+                else: st.warning("Select local printer!"); return False
+            except ImportError: st.error("Pywin32 not installed"); return False
         else:
-            # Both Web/Kiosk and Normal use the Browser trigger
             st.session_state['web_print_trigger'] = bytes_data
             return True
 
@@ -475,10 +481,7 @@ elif st.session_state['page'] == 'scan_print':
                     if 'printed_boxes' not in pkg: pkg['printed_boxes'] = []
                     pkg['printed_boxes'].append(int(target_box))
                     save_history(st.session_state['consignments'])
-                    if print_mode == "Normal Print (Popup)":
-                        st.toast(f"🖨️ Opening Popup for Box {target_box}...", icon="✅")
-                    else:
-                        st.toast(f"🖨️ Printing Box {target_box}...", icon="✅")
+                    st.toast(f"🖨️ Printing Box {target_box}...", icon="✅")
         st.session_state.scan_input = ""
 
     def trigger_reprint_manual(box_num):
@@ -490,7 +493,10 @@ elif st.session_state['page'] == 'scan_print':
     
     with c_pr:
         if print_mode == "Local (Direct USB)":
-            printers = get_windows_printers()
+            try:
+                import win32print
+                printers = [p[2] for p in win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS)]
+            except: printers = ["Default"]
             if 'selected_printer_local' not in st.session_state: st.session_state['selected_printer_local'] = printers[0] if printers else None
             st.selectbox("Select Printer", printers, key='selected_printer_local', label_visibility="collapsed")
         elif print_mode == "Web (Browser Kiosk)":
